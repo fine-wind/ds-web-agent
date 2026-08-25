@@ -145,7 +145,7 @@
         let payload = { action: plan.action };
         if (plan.action !== 'list') payload.path = plan.path || '';
 
-        if (plan.action === 'overwrite' || plan.action === 'append') {
+        if (plan.action === 'create' || plan.action === 'overwrite' || plan.action === 'append') {
             payload.content = plan.content || '';
         } else if (plan.action === 'replace') {
             if (!plan.search || plan.replace === undefined) {
