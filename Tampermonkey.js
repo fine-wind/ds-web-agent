@@ -419,32 +419,24 @@
 
         resetBtn.addEventListener('click', function (e) {
             e.stopPropagation();
-            // 弹出输入框
+            const modal = document.createElement('div');
+            modal.style.cssText = 'position: fixed; bottom: 20%; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.6); padding: 20px; border-radius: 12px; z-index: 10001; min-width: 400px; display: flex; flex-direction: column; gap: 12px;';
             const input = document.createElement('textarea');
-            input.placeholder = '输入要发送的内容...';
-            input.style.cssText = 'position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 400px; height: 150px; z-index: 10000; padding: 10px; font-size: 14px; border-radius: 8px; border: 1px solid #ccc;';
-            const overlay = document.createElement('div');
-            overlay.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.3); z-index: 9999;';
-
+            input.placeholder = '输入要发送的内容... (Ctrl+Enter发送)';
+            input.style.cssText = 'background: rgba(255,255,255,0.9); width: 100%; height: 120px; padding: 10px; font-size: 14px; border-radius: 6px; border: none; resize: vertical; color: #333;';
+            const btnContainer = document.createElement('div');
+            btnContainer.style.cssText = 'display: flex; gap: 10px; justify-content: center;';
             const sendBtn = document.createElement('button');
-            sendBtn.textContent = '发送';
-            sendBtn.style.cssText = 'position: fixed; top: calc(50% + 90px); left: 50%; transform: translateX(-50%); z-index: 10001; padding: 8px 20px; cursor: pointer;';
-
+            sendBtn.textContent = '发送 (Ctrl+Enter)';
+            sendBtn.style.cssText = 'padding: 8px 20px; cursor: pointer; border: none; border-radius: 6px; background: #3964fe; color: white; font-size: 14px;';
             const closeBtn = document.createElement('button');
             closeBtn.textContent = '取消';
-            closeBtn.style.cssText = 'position: fixed; top: calc(50% + 130px); left: 50%; transform: translateX(-50%); z-index: 10001; padding: 8px 20px; cursor: pointer;';
-
-            function cleanup() {
-                overlay.remove();
-                input.remove();
-                sendBtn.remove();
-                closeBtn.remove();
-            }
-
-            sendBtn.addEventListener('click', function () {
+            closeBtn.style.cssText = 'padding: 8px 20px; cursor: pointer; border: none; border-radius: 6px; background: #ccc; color: #333; font-size: 14px;';
+            const overlay = document.createElement('div');
+            overlay.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.2); z-index: 9999;';
+            function sendText() {
                 const text = input.value.trim();
                 if (text) {
-                    // 重置步骤计数
                     iteration = 0;
                     lastAIMessageKey = -1;
                     lastProcessedText = '';
@@ -452,17 +444,28 @@
                     processing = false;
                     sendMessage(text);
                     logInfo('已发送输入内容并重置步骤');
+                    input.value = '';
                 }
-                cleanup();
+            }
+            function closeModal() {
+                overlay.remove();
+                modal.remove();
+            }
+            input.addEventListener('keydown', function(e) {
+                if (e.ctrlKey && e.key === 'Enter') {
+                    e.preventDefault();
+                    sendText();
+                }
             });
-
-            closeBtn.addEventListener('click', cleanup);
-            overlay.addEventListener('click', cleanup);
-
+            sendBtn.addEventListener('click', sendText);
+            closeBtn.addEventListener('click', closeModal);
+            overlay.addEventListener('click', closeModal);
+            btnContainer.appendChild(sendBtn);
+            btnContainer.appendChild(closeBtn);
+            modal.appendChild(input);
+            modal.appendChild(btnContainer);
             document.body.appendChild(overlay);
-            document.body.appendChild(input);
-            document.body.appendChild(sendBtn);
-            document.body.appendChild(closeBtn);
+            document.body.appendChild(modal);
             input.focus();
         });
 
