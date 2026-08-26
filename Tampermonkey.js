@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         DeepSeek Agent (基于 /file 接口)
 // @namespace    http://tampermonkey.net/
-// @version      9.1
-// @description  利用虚拟列表奇偶定位AI回复，调用 /file 接口执行文件操作，悬浮按钮可拖动，含重置输入框
+// @version      9.5
+// @description  无遮罩、无标题、透明背景模态框，拖动整个空白区域，拖动提示前置，彻底无白色面积变化
 // @author       小马
 // @match        https://chat.deepseek.com/*
 // @grant        GM_xmlhttpRequest
@@ -417,23 +417,103 @@
             <span style="font-size:13px;">📝 重置</span>
         `;
 
+        // ========== 重置按钮点击事件（透明背景模态框） ==========
         resetBtn.addEventListener('click', function (e) {
             e.stopPropagation();
+
+            // ----- 创建模态框（透明背景，无边框无阴影）-----
             const modal = document.createElement('div');
-            modal.style.cssText = 'position: fixed; bottom: 20%; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.6); padding: 20px; border-radius: 12px; z-index: 10001; min-width: 400px; display: flex; flex-direction: column; gap: 12px;';
+            modal.style.cssText = `
+                position: fixed;
+                bottom: 20%;
+                left: 50%;
+                transform: translateX(-50%);
+                background: transparent;
+                padding: 0;
+                z-index: 10001;
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+                align-items: center;
+                color: #222;
+                cursor: move;
+            `;
+
+            // ----- 输入框（带背景）-----
             const input = document.createElement('textarea');
-            input.placeholder = '输入要发送的内容... (Ctrl+Enter发送)';
-            input.style.cssText = 'background: rgba(255,255,255,0.9); width: 100%; height: 120px; padding: 10px; font-size: 14px; border-radius: 6px; border: none; resize: vertical; color: #333;';
+            input.placeholder = '输入要发送的内容... (Ctrl+Enter 发送)';
+            input.style.cssText = `
+                background: white;
+                width: 400px;
+                max-width: 90vw;
+                height: 120px;
+                padding: 12px 14px;
+                font-size: 14px;
+                border-radius: 8px;
+                border: 1px solid #ccc;
+                resize: none;
+                color: #222;
+                outline: none;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.15);
+                box-sizing: border-box;
+            `;
+
+            // ----- 按钮容器（拖动提示前置）-----
             const btnContainer = document.createElement('div');
-            btnContainer.style.cssText = 'display: flex; gap: 10px; justify-content: center;';
+            btnContainer.style.cssText = 'display: flex; gap: 10px; justify-content: flex-end; align-items: center; width: 100%;';
+
+            const dragHint = document.createElement('span');
+            dragHint.textContent = '⬇️ 拖动移动';
+            dragHint.style.cssText = 'color: #555; font-size: 13px; margin-right: auto; cursor: move; background: rgba(255,255,255,0.8); padding: 2px 8px; border-radius: 12px;';
+
             const sendBtn = document.createElement('button');
             sendBtn.textContent = '发送 (Ctrl+Enter)';
-            sendBtn.style.cssText = 'padding: 8px 20px; cursor: pointer; border: none; border-radius: 6px; background: #3964fe; color: white; font-size: 14px;';
+            sendBtn.style.cssText = `
+                padding: 8px 20px;
+                cursor: pointer;
+                border: none;
+                border-radius: 8px;
+                background: #3964fe;
+                color: white;
+                font-size: 14px;
+                font-weight: 500;
+                transition: background 0.2s;
+                box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+            `;
+            sendBtn.addEventListener('mouseenter', () => sendBtn.style.background = '#2b4fc7');
+            sendBtn.addEventListener('mouseleave', () => sendBtn.style.background = '#3964fe');
+
             const closeBtn = document.createElement('button');
             closeBtn.textContent = '取消';
-            closeBtn.style.cssText = 'padding: 8px 20px; cursor: pointer; border: none; border-radius: 6px; background: #ccc; color: #333; font-size: 14px;';
-            const overlay = document.createElement('div');
-            overlay.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.2); z-index: 9999;';
+            closeBtn.style.cssText = `
+                padding: 8px 20px;
+                cursor: pointer;
+                border: none;
+                border-radius: 8px;
+                background: #6b7280;
+                color: white;
+                font-size: 14px;
+                transition: background 0.2s;
+                box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+            `;
+            closeBtn.addEventListener('mouseenter', () => closeBtn.style.background = '#4b5563');
+            closeBtn.addEventListener('mouseleave', () => closeBtn.style.background = '#6b7280');
+
+            btnContainer.appendChild(dragHint);
+            btnContainer.appendChild(sendBtn);
+            btnContainer.appendChild(closeBtn);
+
+            modal.appendChild(input);
+            modal.appendChild(btnContainer);
+
+            // ----- 关闭函数 -----
+            function closeModal() {
+                modal.remove();
+                document.removeEventListener('mousemove', onMouseMove);
+                document.removeEventListener('mouseup', onMouseUp);
+            }
+
+            // ----- 发送函数 -----
             function sendText() {
                 const text = input.value.trim();
                 if (text) {
@@ -445,26 +525,57 @@
                     sendMessage(text);
                     logInfo('已发送输入内容并重置步骤');
                     input.value = '';
+                    input.focus();
                 }
             }
-            function closeModal() {
-                overlay.remove();
-                modal.remove();
+
+            // ----- 拖动逻辑（拖动整个模态框，排除输入框和按钮）-----
+            let isDragging = false;
+            let startX, startY, origLeft, origTop;
+
+            function onMouseMove(e) {
+                if (!isDragging) return;
+                const dx = e.clientX - startX;
+                const dy = e.clientY - startY;
+                modal.style.left = (origLeft + dx) + 'px';
+                modal.style.top = (origTop + dy) + 'px';
             }
+
+            function onMouseUp() {
+                isDragging = false;
+            }
+
+            modal.addEventListener('mousedown', function (e) {
+                const target = e.target;
+                if (target.closest('textarea') || target.closest('button')) {
+                    return;
+                }
+                isDragging = true;
+                startX = e.clientX;
+                startY = e.clientY;
+                const rect = modal.getBoundingClientRect();
+                modal.style.left = rect.left + 'px';
+                modal.style.top = rect.top + 'px';
+                modal.style.transform = 'none';
+                origLeft = rect.left;
+                origTop = rect.top;
+                e.preventDefault();
+            });
+
+            document.addEventListener('mousemove', onMouseMove);
+            document.addEventListener('mouseup', onMouseUp);
+
+            // ----- 事件绑定 -----
             input.addEventListener('keydown', function(e) {
                 if (e.ctrlKey && e.key === 'Enter') {
                     e.preventDefault();
                     sendText();
                 }
             });
+
             sendBtn.addEventListener('click', sendText);
             closeBtn.addEventListener('click', closeModal);
-            overlay.addEventListener('click', closeModal);
-            btnContainer.appendChild(sendBtn);
-            btnContainer.appendChild(closeBtn);
-            modal.appendChild(input);
-            modal.appendChild(btnContainer);
-            document.body.appendChild(overlay);
+
             document.body.appendChild(modal);
             input.focus();
         });
@@ -472,35 +583,34 @@
         container.appendChild(btn);
         container.appendChild(resetBtn);
 
-        // ---- 拖动功能 ----
-        let isDragging = false;
-        let startX, startY, origX, origY;
+        // ---- 拖动功能（悬浮容器整体） ----
+        let isDraggingContainer = false;
+        let startXc, startYc, origXc, origYc;
 
         container.addEventListener('mousedown', function (e) {
-            // 只有点击容器本身或空白区域才触发拖动，避免影响按钮点击
             if (e.target === container) {
-                isDragging = true;
-                startX = e.clientX;
-                startY = e.clientY;
+                isDraggingContainer = true;
+                startXc = e.clientX;
+                startYc = e.clientY;
                 const rect = container.getBoundingClientRect();
-                origX = rect.left;
-                origY = rect.top;
+                origXc = rect.left;
+                origYc = rect.top;
                 e.preventDefault();
             }
         });
 
         document.addEventListener('mousemove', function (e) {
-            if (!isDragging) return;
-            const dx = e.clientX - startX;
-            const dy = e.clientY - startY;
-            container.style.left = (origX + dx) + 'px';
-            container.style.top = (origY + dy) + 'px';
+            if (!isDraggingContainer) return;
+            const dx = e.clientX - startXc;
+            const dy = e.clientY - startYc;
+            container.style.left = (origXc + dx) + 'px';
+            container.style.top = (origYc + dy) + 'px';
             container.style.right = 'auto';
             container.style.bottom = 'auto';
         });
 
         document.addEventListener('mouseup', function () {
-            isDragging = false;
+            isDraggingContainer = false;
         });
     }
 
