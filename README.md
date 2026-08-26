@@ -29,11 +29,11 @@ python agent_executor.py
 执行计划示例：
 json
 {
-"task": "创建文件",
-"type": "file",
-"action": "create",
-"path": "test.txt",
-"content": "Hello"
+  "task": "创建文件",
+  "type": "file",
+  "action": "create",
+  "path": "test.txt",
+  "content": "Hello"
 }
 
 

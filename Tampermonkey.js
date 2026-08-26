@@ -6,6 +6,7 @@
 // @author       小马
 // @match        https://chat.deepseek.com/*
 // @grant        GM_xmlhttpRequest
+// @require      https://cdn.jsdelivr.net/npm/json5@2/dist/index.min.js
 // ==/UserScript==
 
 (function () {
@@ -68,8 +69,9 @@
     function parsePlan(text) {
         let jsonStr = text.trim();
         if (!jsonStr) return null;
-        if (jsonStr.startsWith("```json") && jsonStr.endsWith("```")) {
-            jsonStr = jsonStr.slice(7, -3);
+        let searchString = "json复制下载";
+        if (jsonStr.startsWith(searchString)) {
+            jsonStr = jsonStr.slice(searchString.length);
         }
         if (jsonStr.startsWith("{") && jsonStr.endsWith("}")) {
             try {
@@ -423,40 +425,12 @@
 
             // ----- 创建模态框（透明背景，无边框无阴影）-----
             const modal = document.createElement('div');
-            modal.style.cssText = `
-                position: fixed;
-                bottom: 20%;
-                left: 50%;
-                transform: translateX(-50%);
-                background: transparent;
-                padding: 0;
-                z-index: 10001;
-                display: flex;
-                flex-direction: column;
-                gap: 8px;
-                align-items: center;
-                color: #222;
-                cursor: move;
-            `;
+            modal.style.cssText = `position: fixed;bottom: 20%;left: 50%;transform: translateX(-50%);background: transparent;padding: 0;z-index: 10001;display: flex;flex-direction: column;gap: 8px;align-items: center;color: #222;cursor: move;`;
 
             // ----- 输入框（带背景）-----
             const input = document.createElement('textarea');
             input.placeholder = '输入要发送的内容... (Ctrl+Enter 发送)';
-            input.style.cssText = `
-                background: white;
-                width: 400px;
-                max-width: 90vw;
-                height: 120px;
-                padding: 12px 14px;
-                font-size: 14px;
-                border-radius: 8px;
-                border: 1px solid #ccc;
-                resize: none;
-                color: #222;
-                outline: none;
-                box-shadow: 0 2px 10px rgba(0,0,0,0.15);
-                box-sizing: border-box;
-            `;
+            input.style.cssText = `background: white;width: 400px;max-width: 90vw;height: 120px;padding: 12px 14px;font-size: 14px;border-radius: 8px;border: 1px solid #ccc;resize: none;color: #222;outline: none;box-shadow: 0 2px 10px rgba(0,0,0,0.15);box-sizing: border-box;`;
 
             // ----- 按钮容器（拖动提示前置）-----
             const btnContainer = document.createElement('div');
@@ -468,18 +442,7 @@
 
             const sendBtn = document.createElement('button');
             sendBtn.textContent = '发送 (Ctrl+Enter)';
-            sendBtn.style.cssText = `
-                padding: 8px 20px;
-                cursor: pointer;
-                border: none;
-                border-radius: 8px;
-                background: #3964fe;
-                color: white;
-                font-size: 14px;
-                font-weight: 500;
-                transition: background 0.2s;
-                box-shadow: 0 2px 6px rgba(0,0,0,0.1);
-            `;
+            sendBtn.style.cssText = `padding: 8px 20px;cursor: pointer;border: none;border-radius: 8px;background: #3964fe;color: white;font-size: 14px;font-weight: 500;transition: background 0.2s;box-shadow: 0 2px 6px rgba(0,0,0,0.1);`;
             sendBtn.addEventListener('mouseenter', () => sendBtn.style.background = '#2b4fc7');
             sendBtn.addEventListener('mouseleave', () => sendBtn.style.background = '#3964fe');
 
