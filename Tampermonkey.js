@@ -64,7 +64,7 @@
         let contentElement = latest.element.querySelector('.ds-markdown.ds-assistant-message-main-content');
         let text = contentElement ? contentElement.textContent : '';
         text = text.trim();
-        return {text, element: latest.element, key: latest.key};
+        return {text, key: latest.key};
     }
 
     top.window.debugAgent = getLatestAIMessage;
@@ -302,7 +302,7 @@
         sendWebSocketRequest({content: text})
             .then(result => {
                 logInfo('后端处理结果:', result);
-                let msg = '';
+                let msg;
                 if (result.status === 'success') {
                     // 可根据 result.data 定制消息，这里给出通用模板
                     msg = '执行结果：' + JSON.stringify(result.data);
@@ -399,7 +399,6 @@
         logInfo('停止 Agent');
         isRunning = false;
         processing = false;
-        if (observer) observer.disconnect();
         if (wsReconnectTimer) {
             clearTimeout(wsReconnectTimer);
             wsReconnectTimer = null;
