@@ -100,7 +100,10 @@ def process_ai_response(data, request_id=None):
     if not content:
         # 如果 data 直接就是文本，但这里 data 是 dict，所以必须有 content
         return make_response("error", message="缺少 content 字段")
-
+    if content.startswith("🤖"):
+        return
+    content = content.removeprefix("json复制下载")
+    logger.info(f"解码后字符串: {content}")
     cmd = extract_command_from_text(content)
     if not cmd:
         return make_response("error", message="无法从 AI 响应中解析出工具调用 JSON")
@@ -278,6 +281,19 @@ def handle_delete(full_path, recursive=False):
 async def websocket_handler(websocket):
     try:
         async for message in websocket:
+        # ---------- 打印原始消息（调试） ----------
+            logger.info(f"收到消息类型: {type(message)}")
+            if isinstance(message, bytes):
+                # 二进制帧，尝试用 UTF-8 解码
+                try:
+                    decoded = message.decode('utf-8')
+                    logger.info(f"原始字节 (repr): {repr(message)}")
+                    logger.info(f"解码后字符串: {decoded}")
+                except UnicodeDecodeError:
+                    logger.error(f"无法用 UTF-8 解码收到的二进制数据: {repr(message)}")
+            else:
+                # 文本帧，直接是 str
+                logger.info(f"收到文本消息: {repr(message)}")
             try:
                 data = json.loads(message)
                 request_id = data.get('id')
@@ -286,6 +302,8 @@ async def websocket_handler(websocket):
                 if 'action' not in data:
                     # 视为 AI 响应，尝试解析并执行
                     result = process_ai_response(data, request_id)
+                    if result == null:
+                        continue
                     if request_id:
                         result['id'] = request_id
                     await websocket.send(json.dumps(result))

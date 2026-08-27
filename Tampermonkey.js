@@ -287,8 +287,7 @@
         processing = true;
         iteration++;
 
-        logInfo(`📥 收到AI回复 (长度: ${text.length})`);
-        logInfo('内容预览:', text.slice(0, 100) + (text.length > 100 ? '...' : ''));
+        logInfo('AI回复内容预览:', `(长度: ${text.length})`, text.slice(0, 100) + (text.length > 100 ? '...' : ''));
 
         if (isComplete(text)) {
             const msg = iteration >= MAX_ITERATIONS ? `⚠️ 达到最大迭代次数(${MAX_ITERATIONS})，自动停止` : '✅ 任务已完成！';
@@ -377,8 +376,8 @@
 
     function sendPromptOnce(prompt) {
         let pathname = location.pathname.length > 10 ? location.pathname : Math.random();
-        if (!sessionStorage.getItem('agent_prompt_sent' + pathname)) {
-            sessionStorage.setItem('agent_prompt_sent' + pathname, 'true');
+        if (!localStorage.getItem('agent_prompt_sent' + pathname)) {
+            localStorage.setItem('agent_prompt_sent' + pathname, 'true');
             setTimeout(() => {
                 sendMessage(prompt);
                 logInfo('系统提示词已发送');
