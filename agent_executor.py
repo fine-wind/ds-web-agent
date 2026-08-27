@@ -4,20 +4,22 @@
 import os
 import json
 import logging
-import subprocess
-import sys
+import asyncio
+import re
+import shutil
+import tempfile
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
-import shutil
 
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+try:
+    import websockets
+except ImportError:
+    websockets = None
 
 # ---------- 配置（支持环境变量） ----------
-APP_HOST = os.getenv("AGENT_HOST", "0.0.0.0")
-APP_PORT = int(os.getenv("AGENT_PORT", 8888))
 WORK_DIR_ENV = os.getenv("AGENT_WORK_DIR", None)
-CORS_ORIGINS = os.getenv("AGENT_CORS_ORIGINS", "*")   # 生产环境请设置具体域名，如 "https://example.com"
+WS_HOST = os.getenv("AGENT_WS_HOST", "0.0.0.0")
+WS_PORT = int(os.getenv("AGENT_WS_PORT", 8765))
 
 # ---------- 工作目录 ----------
 AGENT_DIR = Path(__file__).parent
@@ -34,7 +36,6 @@ logger.setLevel(logging.INFO)
 handler = RotatingFileHandler(LOG_FILE, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')
 handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 logger.addHandler(handler)
-# 同时输出到控制台（便于调试）
 console = logging.StreamHandler()
 console.setLevel(logging.INFO)
 logger.addHandler(console)
@@ -101,20 +102,21 @@ def handle_read(full_path, offset=0, limit=None, tail=False):
     if full_path.is_dir():
         raise IsADirectoryError(f"路径是目录，不能读取: {full_path.relative_to(WORK_DIR)}")
 
-    # 读取所有行（适用于文本文件）
+    MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+    if full_path.stat().st_size > MAX_FILE_SIZE:
+        raise ValueError(f"文件过大，拒绝读取（最大允许 {MAX_FILE_SIZE // (1024*1024)}MB）: {full_path.relative_to(WORK_DIR)}")
+
     with open(full_path, 'r', encoding='utf-8') as f:
         lines = f.readlines()
 
     total_lines = len(lines)
 
     if tail:
-        # 如果 tail=True，取末尾 limit 行，默认 limit=10
         if limit is None:
             limit = 10
         start = max(0, total_lines - limit)
         selected = lines[start:]
     else:
-        # 正常分页
         start = max(0, offset)
         if limit is not None and limit > 0:
             end = min(start + limit, total_lines)
@@ -123,7 +125,6 @@ def handle_read(full_path, offset=0, limit=None, tail=False):
             selected = lines[start:]
 
     selected_text = ''.join(selected)
-    # 返回时附上总行数和实际返回行数
     return make_response("success", data={
         "path": str(full_path.relative_to(WORK_DIR)),
         "content": selected_text,
@@ -135,7 +136,6 @@ def handle_read(full_path, offset=0, limit=None, tail=False):
     })
 
 def handle_overwrite(full_path, content):
-    """覆盖写入文件"""
     if not full_path.exists():
         raise FileNotFoundError(f'文件不存在: {full_path.relative_to(WORK_DIR)}')
     if full_path.is_dir():
@@ -146,7 +146,6 @@ def handle_overwrite(full_path, content):
     return make_response("success", data={"path": str(full_path.relative_to(WORK_DIR)), "size": full_path.stat().st_size})
 
 def handle_append(full_path, content):
-    """追加内容到文件末尾"""
     if not full_path.exists():
         raise FileNotFoundError(f'文件不存在: {full_path.relative_to(WORK_DIR)}')
     if full_path.is_dir():
@@ -157,32 +156,55 @@ def handle_append(full_path, content):
     return make_response("success", data={"path": str(full_path.relative_to(WORK_DIR)), "size": full_path.stat().st_size})
 
 def handle_replace(full_path, search, replace, count=1):
-    """搜索替换（方案三）"""
     if not full_path.exists():
         raise FileNotFoundError(f'文件不存在: {full_path.relative_to(WORK_DIR)}')
     if full_path.is_dir():
         raise IsADirectoryError(f'路径是目录，不能执行此操作: {full_path.relative_to(WORK_DIR)}')
-    with open(full_path, 'r', encoding='utf-8') as f:
-        old_text = f.read()
-    import re
-    # count=0 表示不替换，count=-1 表示替换全部，count>0 替换指定次数
+
     if count == 0:
-        new_text = old_text
-        replaced_count = 0
-    else:
-        subn_count = 0 if count == -1 else count
-        new_text, replaced_count = re.subn(re.escape(search), replace, old_text, count=subn_count)
-    with open(full_path, 'w', encoding='utf-8') as f:
-        f.write(new_text)
-    logger.info(f"替换文件: {full_path.relative_to(WORK_DIR)}，替换次数: {replaced_count}")
-    return make_response("success", data={
-        "path": str(full_path.relative_to(WORK_DIR)),
-        "size": full_path.stat().st_size,
-        "replaced_count": replaced_count,
-        "search": search,
-        "replace": replace,
-        "count": count
-    })
+        logger.info(f"替换操作跳过（count=0）: {full_path.relative_to(WORK_DIR)}")
+        return make_response("success", data={
+            "path": str(full_path.relative_to(WORK_DIR)),
+            "size": full_path.stat().st_size,
+            "replaced_count": 0,
+            "search": search,
+            "replace": replace,
+            "count": count
+        })
+
+    pattern = re.compile(re.escape(search))
+    replaced_count = 0
+    remaining = None if count == -1 else count
+
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=full_path.parent, prefix='.replace_tmp_')
+    try:
+        with os.fdopen(tmp_fd, 'w', encoding='utf-8') as tmp_file:
+            with open(full_path, 'r', encoding='utf-8') as src_file:
+                for line in src_file:
+                    if remaining is None:
+                        new_line, sub_count = pattern.subn(replace, line)
+                        replaced_count += sub_count
+                    elif remaining > 0:
+                        new_line, sub_count = pattern.subn(replace, line, count=remaining)
+                        replaced_count += sub_count
+                        remaining -= sub_count
+                    else:
+                        new_line = line
+                    tmp_file.write(new_line)
+        os.replace(tmp_path, full_path)
+        logger.info(f"替换文件: {full_path.relative_to(WORK_DIR)}，替换次数: {replaced_count}")
+        return make_response("success", data={
+            "path": str(full_path.relative_to(WORK_DIR)),
+            "size": full_path.stat().st_size,
+            "replaced_count": replaced_count,
+            "search": search,
+            "replace": replace,
+            "count": count
+        })
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
 
 def handle_delete(full_path, recursive=False):
     if not full_path.exists():
@@ -194,9 +216,9 @@ def handle_delete(full_path, recursive=False):
                     p = Path(root) / name
                     if p.is_symlink():
                         raise ValueError(f'目录内包含符号链接，禁止递归删除: {p.relative_to(WORK_DIR)}')
-                    shutil.rmtree(full_path)
-                    logger.info(f"递归删除目录: {full_path.relative_to(WORK_DIR)}")
-                    return make_response("success", data={"path": str(full_path.relative_to(WORK_DIR)), "deleted": True, "recursive": True})
+            shutil.rmtree(full_path)
+            logger.info(f"递归删除目录: {full_path.relative_to(WORK_DIR)}")
+            return make_response("success", data={"path": str(full_path.relative_to(WORK_DIR)), "deleted": True, "recursive": True})
         else:
             raise IsADirectoryError(f"路径是目录，不允许删除（设置 recursive=true 可强制删除）: {full_path.relative_to(WORK_DIR)}")
     else:
@@ -206,111 +228,153 @@ def handle_delete(full_path, recursive=False):
         logger.info(f"删除文件: {full_path.relative_to(WORK_DIR)}")
         return make_response("success", data={"path": str(full_path.relative_to(WORK_DIR)), "deleted": True})
 
-# ---------- Flask 应用 ----------
-app = Flask(__name__)
-# CORS 配置
-if CORS_ORIGINS == "*":
-    CORS(app)
-else:
-    origins = [origin.strip() for origin in CORS_ORIGINS.split(',') if origin.strip()]
-    CORS(app, origins=origins)
-
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify(make_response("success", data={"status": "running", "workspace": str(WORK_DIR)}))
-
-@app.route('/prompt', methods=['GET'])
-def get_prompt():
-    return jsonify(make_response("success", data={"prompt": load_prompt()}))
-
-@app.route('/file', methods=['POST'])
-def file_operations():
+# ---------- WebSocket 处理 ----------
+async def websocket_handler(websocket):
+    """WebSocket 统一处理端点"""
     try:
-        data = request.get_json()
-        if data is None:
-            return jsonify(make_response("error", message="无效的JSON")), 400
-
-        action = data.get('action')
-        if action not in ['create', 'read', 'delete', 'list', 'overwrite', 'append', 'replace']:
-            return jsonify(make_response("error", message="不支持的 action，可选: create/read/delete/list/overwrite/append/replace")), 400
-
-        if action == 'list':
+        async for message in websocket:
             try:
-                result = handle_list(data)
-                return jsonify(result), 200
-            except Exception as e:
-                logger.error(f"列表操作失败: {e}")
-                return jsonify(make_response("error", message=str(e))), 500
+                data = json.loads(message)
+                request_id = data.get('id')
+                action = data.get('action')
 
-        file_path = data.get('path')
-        if not file_path:
-            return jsonify(make_response("error", message="缺少 path 参数")), 400
+                # 处理 prompt 动作（无需 path）
+                if action == 'prompt':
+                    try:
+                        prompt = load_prompt()
+                        result = make_response("success", data={"prompt": prompt})
+                    except Exception as e:
+                        logger.error(f"获取提示词失败: {e}")
+                        result = make_response("error", message=str(e))
+                    if request_id:
+                        result['id'] = request_id
+                    await websocket.send(json.dumps(result))
+                    continue
 
-        try:
-            full_path = safe_path(file_path)
-        except ValueError as e:
-            return jsonify(make_response("error", message=str(e))), 400
+                if action not in ['create', 'read', 'delete', 'list', 'overwrite', 'append', 'replace']:
+                    resp = make_response("error", message="不支持的 action")
+                    if request_id:
+                        resp['id'] = request_id
+                    await websocket.send(json.dumps(resp))
+                    continue
 
-        try:
-            if action == 'create':
-                content = data.get('content', '')
-                result = handle_create(full_path, content)
-                return jsonify(result), 201
-            elif action == 'read':
-                offset = int(data.get('offset', 0))
-                limit = data.get('limit')   # 可能为 None
-                if limit is not None:
-                    limit = int(limit)
-                tail = data.get('tail', False)
-                # 若 tail=True 且 limit 未提供，默认设置为 10
-                if tail and limit is None:
-                    limit = 10
-                result = handle_read(full_path, offset, limit, tail)
-                return jsonify(result), 200
-            elif action == 'overwrite':
-                content = data.get('content', '')
-                result = handle_overwrite(full_path, content)
-                return jsonify(result), 200
+                if action == 'list':
+                    try:
+                        result = handle_list(data)
+                        if request_id:
+                            result['id'] = request_id
+                        await websocket.send(json.dumps(result))
+                    except Exception as e:
+                        logger.error(f"列表操作失败: {e}")
+                        resp = make_response("error", message=str(e))
+                        if request_id:
+                            resp['id'] = request_id
+                        await websocket.send(json.dumps(resp))
+                    continue
 
-            elif action == 'append':
-                content = data.get('content', '')
-                result = handle_append(full_path, content)
-                return jsonify(result), 200
+                file_path = data.get('path')
+                if not file_path:
+                    resp = make_response("error", message="缺少 path 参数")
+                    if request_id:
+                        resp['id'] = request_id
+                    await websocket.send(json.dumps(resp))
+                    continue
 
-            elif action == 'replace':
-                search = data.get('search')
-                replace = data.get('replace')
-                if search is None or replace is None:
-                    return jsonify(make_response("error", message="replace 操作需要提供 search 和 replace 参数")), 400
-                count = data.get('count', 1)
-                if count is not None:
-                    count = int(count)
-                result = handle_replace(full_path, search, replace, count)
-                return jsonify(result), 200
-            elif action == 'delete':
-                recursive = data.get('recursive', False)
-                result = handle_delete(full_path, recursive)
-                return jsonify(result), 200
-        except FileNotFoundError as e:
-            return jsonify(make_response("error", message=str(e))), 404
-        except IsADirectoryError as e:
-            return jsonify(make_response("error", message=str(e))), 400
-        except PermissionError as e:
-            return jsonify(make_response("error", message=str(e))), 403
-        except Exception as e:
-            logger.error(f"操作失败: {e}")
-            return jsonify(make_response("error", message="内部服务器错误")), 500
+                try:
+                    full_path = safe_path(file_path)
+                except ValueError as e:
+                    resp = make_response("error", message=str(e))
+                    if request_id:
+                        resp['id'] = request_id
+                    await websocket.send(json.dumps(resp))
+                    continue
 
+                try:
+                    if action == 'create':
+                        content = data.get('content', '')
+                        result = handle_create(full_path, content)
+                    elif action == 'read':
+                        offset = int(data.get('offset', 0))
+                        limit = data.get('limit')
+                        if limit is not None:
+                            limit = int(limit)
+                        tail = data.get('tail', False)
+                        if tail and limit is None:
+                            limit = 10
+                        result = handle_read(full_path, offset, limit, tail)
+                    elif action == 'overwrite':
+                        content = data.get('content', '')
+                        result = handle_overwrite(full_path, content)
+                    elif action == 'append':
+                        content = data.get('content', '')
+                        result = handle_append(full_path, content)
+                    elif action == 'replace':
+                        search = data.get('search')
+                        replace = data.get('replace')
+                        if search is None or replace is None:
+                            resp = make_response("error", message="replace 操作需要提供 search 和 replace 参数")
+                            if request_id:
+                                resp['id'] = request_id
+                            await websocket.send(json.dumps(resp))
+                            continue
+                        count = data.get('count', 1)
+                        if count is not None:
+                            count = int(count)
+                        result = handle_replace(full_path, search, replace, count)
+                    elif action == 'delete':
+                        recursive = data.get('recursive', False)
+                        result = handle_delete(full_path, recursive)
+                    else:
+                        result = make_response("error", message="未知操作")
+                    if request_id:
+                        result['id'] = request_id
+                    await websocket.send(json.dumps(result))
+                except FileNotFoundError as e:
+                    resp = make_response("error", message=str(e))
+                    if request_id:
+                        resp['id'] = request_id
+                    await websocket.send(json.dumps(resp))
+                except IsADirectoryError as e:
+                    resp = make_response("error", message=str(e))
+                    if request_id:
+                        resp['id'] = request_id
+                    await websocket.send(json.dumps(resp))
+                except PermissionError as e:
+                    resp = make_response("error", message=str(e))
+                    if request_id:
+                        resp['id'] = request_id
+                    await websocket.send(json.dumps(resp))
+                except Exception as e:
+                    logger.error(f"WebSocket 操作失败: {e}")
+                    resp = make_response("error", message="内部服务器错误")
+                    if request_id:
+                        resp['id'] = request_id
+                    await websocket.send(json.dumps(resp))
+            except json.JSONDecodeError:
+                await websocket.send(json.dumps(make_response("error", message="无效的 JSON")))
+    except websockets.exceptions.ConnectionClosed:
+        logger.info("WebSocket 连接关闭")
     except Exception as e:
-        logger.error(f"请求处理异常: {e}")
-        return jsonify(make_response("error", message="服务器内部错误")), 500
+        logger.error(f"WebSocket 处理异常: {e}")
 
+# ---------- 启动 WebSocket 服务 ----------
 if __name__ == '__main__':
-    print(f"🚀 Agent 执行服务启动")
+    if websockets is None:
+        print("❌ 未安装 websockets 库，请执行: pip install websockets")
+        exit(1)
+
+    print(f"🚀 Agent WebSocket 服务启动")
     print(f"📁 工作目录: {WORK_DIR}")
-    print(f"🌐 监听地址: {APP_HOST}:{APP_PORT}")
+    print(f"🔌 WebSocket 监听地址: {WS_HOST}:{WS_PORT}")
     print(f"📋 日志文件: {LOG_FILE} (轮转: 10MB/5备份)")
-    print(f"📝 提示词来源: {AGENT_DIR / 'prompt.md' if (AGENT_DIR / 'prompt.md').exists() else '内置默认'}")
-    print(f"🔒 CORS 允许来源: {CORS_ORIGINS}")
-    print("按 Ctrl+C 停止服务")
-    app.run(host=APP_HOST, port=APP_PORT, debug=False)
+    prompt_file = AGENT_DIR / "prompt.md"
+    print(f"📝 提示词来源: {prompt_file if prompt_file.exists() else '内置默认'}")
+
+    async def start_ws():
+        async with websockets.serve(websocket_handler, WS_HOST, WS_PORT):
+            await asyncio.Future()  # 永久运行
+
+    try:
+        asyncio.run(start_ws())
+    except KeyboardInterrupt:
+        print("服务已停止")
