@@ -14,9 +14,7 @@
 
     // ============ 配置 ============
     const WS_URL = 'ws://localhost:8765';
-    const MAX_RETRY = 3;
-    const MAX_ITERATIONS = 200;
-    const SILENT_WAIT = 2800;
+
     const DEFAULT_PROMPT = `你好`;
 
     // ============ 日志工具 ============
@@ -34,16 +32,10 @@
 
     // ============ 状态 ============
     let isRunning = false;
-    let iteration = 0;
-    let processing = false;
-    let lastMsg = '';
-    let retryCount = 0;
-    let currentPlan = null;
-    let observer = null;
-    let messageTimers = new Map();
-    let lastProcessedText = '';
-    let lastFoundText = '';
-    let lastAIMessageKey = -1;
+    const SILENT_WAIT = 1800;// 静默时间
+    let processing = false; // 正在执行任务吗
+    let iteration = 0;// 任务已经执行的步数
+    const MAX_ITERATIONS = 200; // 执行最大步数
 
     // WebSocket 相关状态
     let ws = null;
@@ -51,9 +43,6 @@
     let wsRequestId = 0;
     let pendingRequests = new Map();
     let wsReconnectTimer = null;
-    let wsReconnectAttempts = 0;
-    const WS_MAX_RECONNECT_ATTEMPTS = 10;
-    const WS_RECONNECT_DELAY = 3000;
 
     // ============ 核心：通过虚拟列表 key 获取最新 AI 消息 ============
     function getLatestAIMessage() {
@@ -71,9 +60,6 @@
 
         aiItems.sort((a, b) => a.key - b.key);
         const latest = aiItems[aiItems.length - 1];
-        if (latest.key === lastAIMessageKey) {
-            return null;
-        }
 
         let contentElement = latest.element.querySelector('.ds-markdown.ds-assistant-message-main-content');
         let text = contentElement ? contentElement.textContent : '';
@@ -155,11 +141,10 @@
 
         ws.onopen = function () {
             wsConnected = true;
-            wsReconnectAttempts = 0;
             logInfo('✅ WebSocket 已连接');
             for (const [id, pending] of pendingRequests) {
                 clearTimeout(pending.timer);
-                pending.reject(new Error('WebSocket 重连，请求已取消'));
+                // pending.reject(new Error('WebSocket 重连，请求已取消'));
                 pendingRequests.delete(id);
             }
         };
@@ -197,22 +182,24 @@
         };
     }
 
+    /**
+     * 重新连接websocket
+     */
     function scheduleReconnect() {
         if (!isRunning) return;
         if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
-        if (wsReconnectAttempts >= WS_MAX_RECONNECT_ATTEMPTS) {
-            logError('WebSocket 重连次数已达上限，停止尝试');
-            return;
-        }
-        wsReconnectAttempts++;
-        const delay = WS_RECONNECT_DELAY * Math.min(wsReconnectAttempts, 5);
-        logWarn(`将在 ${delay}ms 后尝试重连 (第 ${wsReconnectAttempts} 次)`);
+
         wsReconnectTimer = setTimeout(() => {
             wsReconnectTimer = null;
             connectWebSocket();
-        }, delay);
+        }, 1000);
     }
 
+    /**
+     * 发送WebSocket消息
+     * @param payload
+     * @returns {Promise<unknown>}
+     */
     function sendWebSocketRequest(payload) {
         return new Promise((resolve, reject) => {
             if (!wsConnected || !ws || ws.readyState !== WebSocket.OPEN) {
@@ -232,7 +219,7 @@
 
             try {
                 ws.send(JSON.stringify(message));
-                logInfo(`🚀 WebSocket 发送: ${payload.action} ${payload.path || ''}`);
+                logInfo(`🚀 WebSocket 发送: ${JSON.stringify(payload)}`, message);
             } catch (e) {
                 clearTimeout(timeout);
                 pendingRequests.delete(id);
@@ -279,11 +266,13 @@
         });
     }
 
+    /**
+     * ai内容回复
+     * @param text
+     */
     function processAIResponse(text) {
         if (!isRunning || processing) return;
-        if (!text || text === lastMsg) return;
 
-        lastMsg = text;
         processing = true;
         iteration++;
 
@@ -300,6 +289,10 @@
         forwardAIResponseToBackend(text);
     }
 
+    /**
+     * 转发给后端解析和执行
+     * @param text 执行结果
+     */
     function forwardAIResponseToBackend(text) {
         // 如果 WebSocket 未连接，尝试连接（sendWebSocketRequest 内部会检查）
         if (!wsConnected) {
@@ -314,6 +307,7 @@
                     // 可根据 result.data 定制消息，这里给出通用模板
                     msg = '执行结果：' + JSON.stringify(result.data);
                 } else {
+                    debugger
                     msg = `执行结果：操作失败，${result.message || '未知错误'}`;
                 }
                 sendMessage(msg);
@@ -321,57 +315,41 @@
             })
             .catch(err => {
                 logError('后端处理请求失败:', err);
+                debugger
                 sendMessage(`执行结果：请求失败，${err.message || '未知错误'}`);
                 processing = false;
             });
     }
 
+    /**
+     * 监听ai回复
+     */
     function setupDOMObserver() {
-        if (observer) {
-            observer.disconnect();
-            observer = null;
-        }
-        for (const timer of messageTimers.values()) clearTimeout(timer);
-        messageTimers.clear();
-
-        observer = new MutationObserver(() => {
-            if (!isRunning || processing) return;
-            const msg = getLatestAIMessage();
-            if (!msg) return;
-            const currentText = msg.text;
-            if (msg.key === lastAIMessageKey && currentText === lastProcessedText) return;
-
-            const msgId = 'ai_' + msg.key;
-            if (messageTimers.has(msgId)) clearTimeout(messageTimers.get(msgId));
-
-            const timer = setTimeout(() => {
-                messageTimers.delete(msgId);
-                const latest = getLatestAIMessage();
-                if (!latest) return;
-                const finalText = latest.text;
-                if (finalText === lastProcessedText) return;
-                if (finalText.length < 10) return;
-
-                lastProcessedText = finalText;
-                lastAIMessageKey = latest.key;
-                logInfo('静默期结束，处理AI回复', finalText.slice(0, 100));
-                processAIResponse(finalText);
-            }, SILENT_WAIT + Math.random() * 10);
-
-            messageTimers.set(msgId, timer);
-        });
-
-        observer.observe(document.body, {
-            childList: true,
-            subtree: true,
-            characterData: true,
-            characterDataOldValue: false,
-            attributes: true,
-            attributeFilter: ['data-virtual-list-item-key']
-        });
-
-        logInfo(`DOM 监听已启动（静默期 ${SILENT_WAIT}ms）`);
-        setTimeout(getLatestAIMessage, 2000);
+        let lastAIMessageKey = -1; // 上一次的key
+        let lastProcessedText = '';// 上一次内容
+        let lastOver = false;// 上一次是否已经执行了
+        setInterval(() => {
+            const latest = getLatestAIMessage();
+            if (!latest) return;
+            // 和上次一样的跳过
+            if (latest.key === lastAIMessageKey) {
+                const finalText = latest.text || Math.random();
+                if (finalText === lastProcessedText) {
+                    if (!lastOver) {
+                        logInfo('监测到AI回复完毕', finalText.slice(0, 100));
+                        // 标记这个已经可以处理了
+                        lastOver = true;
+                        processAIResponse(finalText);
+                    }
+                } else {
+                    lastProcessedText = finalText;
+                    lastOver = false;
+                }
+            }
+            lastAIMessageKey = latest.key
+            logInfo(`监听AI回复`, latest);
+        }, SILENT_WAIT)
+        logInfo(`监听AI回复已启动（周期 ${SILENT_WAIT}ms）`);
     }
 
     function sendPromptOnce(prompt) {
@@ -388,11 +366,7 @@
     function startAgent(skipPrompt) {
         logInfo('启动 Agent');
         iteration = 0;
-        lastMsg = '';
         processing = false;
-        lastProcessedText = '';
-        lastFoundText = '';
-        lastAIMessageKey = -1;
 
         if (!wsConnected) {
             connectWebSocket();
@@ -547,9 +521,6 @@
                 const text = input.value.trim();
                 if (text) {
                     iteration = 0;
-                    lastAIMessageKey = -1;
-                    lastProcessedText = '';
-                    lastMsg = '';
                     processing = false;
                     sendMessage(text);
                     logInfo('已发送输入内容并重置步骤');

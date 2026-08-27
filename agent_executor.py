@@ -302,7 +302,7 @@ async def websocket_handler(websocket):
                 if 'action' not in data:
                     # 视为 AI 响应，尝试解析并执行
                     result = process_ai_response(data, request_id)
-                    if result == null:
+                    if result is None:
                         continue
                     if request_id:
                         result['id'] = request_id
