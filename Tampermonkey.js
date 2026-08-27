@@ -64,7 +64,7 @@
         let contentElement = latest.element.querySelector('.ds-markdown.ds-assistant-message-main-content');
         let text = contentElement ? contentElement.textContent : '';
         text = text.trim();
-        return {text, key: latest.key};
+        return {text, element: latest.element, key: latest.key};
     }
 
     top.window.debugAgent = getLatestAIMessage;
@@ -302,12 +302,22 @@
         sendWebSocketRequest({content: text})
             .then(result => {
                 logInfo('后端处理结果:', result);
-                let msg;
+                let msg = '';
                 if (result.status === 'success') {
-                    // 可根据 result.data 定制消息，这里给出通用模板
-                    msg = '执行结果：' + JSON.stringify(result.data);
+                    // 根据 data 类型构造消息内容
+                    let dataStr = '';
+                    const data = result.data;
+                    if (data === null || data === undefined) {
+                        dataStr = '无返回数据';
+                    } else if (typeof data === 'object') {
+                        // 对象或数组：转为格式化的 JSON 字符串（缩进 2 空格）
+                        dataStr = JSON.stringify(data, null, 2);
+                    } else {
+                        // 字符串、数字、布尔值等
+                        dataStr = data;
+                    }
+                    msg = '执行结果：' + dataStr;
                 } else {
-                    debugger
                     msg = `执行结果：操作失败，${result.message || '未知错误'}`;
                 }
                 sendMessage(msg);
@@ -315,10 +325,11 @@
             })
             .catch(err => {
                 logError('后端处理请求失败:', err);
-                debugger
-                sendMessage(`执行结果：请求失败，${err.message || '未知错误'}`);
+                debugger;
+                // sendMessage(`执行结果：请求失败，${err.message || '未知错误'}`);
                 processing = false;
             });
+
     }
 
     /**
@@ -333,7 +344,7 @@
             if (!latest) return;
             // 和上次一样的跳过
             if (latest.key === lastAIMessageKey) {
-                const finalText = latest.text || Math.random();
+                const finalText = latest.text || Math.random().toString();
                 if (finalText === lastProcessedText) {
                     if (!lastOver) {
                         logInfo('监测到AI回复完毕', finalText.slice(0, 100));
@@ -347,7 +358,7 @@
                 }
             }
             lastAIMessageKey = latest.key
-            logInfo(`监听AI回复`, latest);
+            logInfo(`监听AI回复`, lastAIMessageKey, lastProcessedText.slice(-100));
         }, SILENT_WAIT)
         logInfo(`监听AI回复已启动（周期 ${SILENT_WAIT}ms）`);
     }

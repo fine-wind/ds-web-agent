@@ -220,40 +220,28 @@ def handle_replace(full_path, search, replace, count=1):
             "replace": replace,
             "count": count
         })
-
+    MAX_FILE_SIZE = 50 * 1024 * 1024
+    if full_path.stat().st_size > MAX_FILE_SIZE:
+        raise ValueError(f'文件过大，拒绝读取（最大允许 {MAX_FILE_SIZE // (1024*1024)}MB）: {full_path.relative_to(WORK_DIR)}')
+    with open(full_path, 'r', encoding='utf-8') as f:
+        content = f.read()
     pattern = re.compile(re.escape(search))
-    replaced_count = 0
-    remaining = None if count == -1 else count
-
-    tmp_fd, tmp_path = tempfile.mkstemp(dir=full_path.parent, prefix='.replace_tmp_')
-    try:
-        with os.fdopen(tmp_fd, 'w', encoding='utf-8') as tmp_file:
-            with open(full_path, 'r', encoding='utf-8') as src_file:
-                for line in src_file:
-                    if remaining is None:
-                        new_line, sub_count = pattern.subn(replace, line)
-                        replaced_count += sub_count
-                    elif remaining > 0:
-                        new_line, sub_count = pattern.subn(replace, line, count=remaining)
-                        replaced_count += sub_count
-                        remaining -= sub_count
-                    else:
-                        new_line = line
-                    tmp_file.write(new_line)
-        os.replace(tmp_path, full_path)
-        logger.info(f"替换文件: {full_path.relative_to(WORK_DIR)}，替换次数: {replaced_count}")
-        return make_response("success", data={
-            "path": str(full_path.relative_to(WORK_DIR)),
-            "size": full_path.stat().st_size,
-            "replaced_count": replaced_count,
-            "search": search,
-            "replace": replace,
-            "count": count
-        })
-    except Exception:
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-        raise
+    re_count = count if count > 0 else 0
+    new_content, replaced_count = pattern.subn(replace, content, count=re_count)
+    if replaced_count > 0:
+        with open(full_path, 'w', encoding='utf-8') as f:
+            f.write(new_content)
+        logger.info(f'替换文件: {full_path.relative_to(WORK_DIR)}，替换次数: {replaced_count}')
+    else:
+        logger.info(f'替换操作无匹配: {full_path.relative_to(WORK_DIR)}')
+    return make_response('success', data={
+        'path': str(full_path.relative_to(WORK_DIR)),
+        'size': full_path.stat().st_size,
+        'replaced_count': replaced_count,
+        'search': search,
+        'replace': replace,
+        'count': count
+    })
 
 def handle_delete(full_path, recursive=False):
     if not full_path.exists():
@@ -281,7 +269,7 @@ def handle_delete(full_path, recursive=False):
 async def websocket_handler(websocket):
     try:
         async for message in websocket:
-        # ---------- 打印原始消息（调试） ----------
+            # ---------- 打印原始消息（调试） ----------
             logger.info(f"收到消息类型: {type(message)}")
             if isinstance(message, bytes):
                 # 二进制帧，尝试用 UTF-8 解码
