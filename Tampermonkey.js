@@ -20,9 +20,17 @@
     const DEFAULT_PROMPT = `你好`;
 
     // ============ 日志工具 ============
-    function logInfo(...args) { console.log('[Agent]', ...args); }
-    function logWarn(...args) { console.warn('[Agent]', ...args); }
-    function logError(...args) { console.error('[Agent]', ...args); }
+    function logInfo(...args) {
+        console.log('[Agent]', ...args);
+    }
+
+    function logWarn(...args) {
+        console.warn('[Agent]', ...args);
+    }
+
+    function logError(...args) {
+        console.error('[Agent]', ...args);
+    }
 
     // ============ 状态 ============
     let isRunning = false;
@@ -56,7 +64,7 @@
         for (const el of items) {
             const key = parseInt(el.getAttribute('data-virtual-list-item-key'), 10);
             if (!isNaN(key) && key % 2 === 0) {
-                aiItems.push({ key, element: el });
+                aiItems.push({key, element: el});
             }
         }
         if (aiItems.length === 0) return null;
@@ -70,40 +78,11 @@
         let contentElement = latest.element.querySelector('.ds-markdown.ds-assistant-message-main-content');
         let text = contentElement ? contentElement.textContent : '';
         text = text.trim();
-        return { text, element: latest.element, key: latest.key };
+        return {text, element: latest.element, key: latest.key};
     }
 
     top.window.debugAgent = getLatestAIMessage;
 
-    function parsePlan(text) {
-        let jsonStr = text.trim();
-        if (!jsonStr) return null;
-        let searchString = "json复制下载";
-        if (jsonStr.startsWith(searchString)) {
-            jsonStr = jsonStr.slice(searchString.length);
-        }
-        if (jsonStr.startsWith("{") && jsonStr.endsWith("}")) {
-            try {
-                const plan = JSON.parse(jsonStr);
-                if (plan.type === 'file') {
-                    const allowedActions = ['create', 'read', 'delete', 'list', 'overwrite', 'append', 'replace'];
-                    if (!plan.action || !allowedActions.includes(plan.action)) {
-                        logWarn('计划缺少 action 或 action 无效');
-                        return null;
-                    }
-                    if (plan.action !== 'list' && !plan.path) {
-                        logWarn('非 list 操作缺少 path 字段');
-                        return null;
-                    }
-                }
-                return plan;
-            } catch (e) {
-                logError('JSON解析失败:', e);
-                return 'JSON_ERROR ' + e.message;
-            }
-        }
-        return null;
-    }
 
     function isComplete(text) {
         return text.includes('===TASK_COMPLETE===') || iteration >= MAX_ITERATIONS;
@@ -112,18 +91,24 @@
     function sendMessage(text) {
         logInfo('📤 发送消息:', text.slice(0, 200) + (text.length > 200 ? '...' : ''));
         const ta = document.querySelector('textarea[placeholder*="发送消息"]');
-        if (!ta) { logError('未找到输入框'); return; }
+        if (!ta) {
+            logError('未找到输入框');
+            return;
+        }
         ta.focus();
 
         let success = false;
         if (document.execCommand) {
-            try { success = document.execCommand('insertText', false, text); } catch (e) {}
+            try {
+                success = document.execCommand('insertText', false, text);
+            } catch (e) {
+            }
         }
         if (!success) {
             ta.value = text;
-            ta.dispatchEvent(new Event('input', { bubbles: true }));
-            ta.dispatchEvent(new Event('change', { bubbles: true }));
-            ta.dispatchEvent(new Event('compositionend', { bubbles: true }));
+            ta.dispatchEvent(new Event('input', {bubbles: true}));
+            ta.dispatchEvent(new Event('change', {bubbles: true}));
+            ta.dispatchEvent(new Event('compositionend', {bubbles: true}));
         }
 
         setTimeout(() => {
@@ -141,12 +126,12 @@
                 setTimeout(() => {
                     if (ta.value !== '') {
                         ta.value = '';
-                        ta.dispatchEvent(new Event('input', { bubbles: true }));
+                        ta.dispatchEvent(new Event('input', {bubbles: true}));
                     }
                 }, 100);
             } else {
-                ta.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
-                ta.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }));
+                ta.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true}));
+                ta.dispatchEvent(new KeyboardEvent('keyup', {key: 'Enter', bubbles: true}));
                 logInfo('⚠️ 未找到发送按钮，模拟 Enter 键');
             }
         }, 400);
@@ -236,14 +221,14 @@
             }
 
             const id = ++wsRequestId;
-            const message = Object.assign({ id: id }, payload);
+            const message = Object.assign({id: id}, payload);
 
             const timeout = setTimeout(() => {
                 pendingRequests.delete(id);
                 reject(new Error('WebSocket 请求超时'));
             }, 30000);
 
-            pendingRequests.set(id, { resolve, reject, timer: timeout });
+            pendingRequests.set(id, {resolve, reject, timer: timeout});
 
             try {
                 ws.send(JSON.stringify(message));
@@ -264,7 +249,7 @@
                 const startWait = Date.now();
                 const waitForConnection = () => {
                     if (wsConnected && ws && ws.readyState === WebSocket.OPEN) {
-                        sendWebSocketRequest({ action: 'prompt' })
+                        sendWebSocketRequest({action: 'prompt'})
                             .then(result => {
                                 if (result.status === 'success' && result.data && result.data.prompt) {
                                     resolve(result.data.prompt);
@@ -281,7 +266,7 @@
                 };
                 waitForConnection();
             } else {
-                sendWebSocketRequest({ action: 'prompt' })
+                sendWebSocketRequest({action: 'prompt'})
                     .then(result => {
                         if (result.status === 'success' && result.data && result.data.prompt) {
                             resolve(result.data.prompt);
@@ -291,89 +276,6 @@
                     })
                     .catch(reject);
             }
-        });
-    }
-
-    function callFileAPI(plan, callback) {
-        let payload = { action: plan.action };
-        if (plan.action !== 'list') payload.path = plan.path || '';
-
-        if (plan.action === 'create' || plan.action === 'overwrite' || plan.action === 'append') {
-            payload.content = plan.content || '';
-        } else if (plan.action === 'replace') {
-            if (!plan.search || plan.replace === undefined) {
-                callback(new Error('replace 操作缺少 search 或 replace 字段'), null);
-                return;
-            }
-            payload.search = plan.search;
-            payload.replace = plan.replace;
-            if (plan.count !== undefined) payload.count = plan.count;
-        }
-
-        if (!wsConnected) {
-            connectWebSocket();
-        }
-
-        const startWait = Date.now();
-        const waitForConnection = () => {
-            if (wsConnected && ws && ws.readyState === WebSocket.OPEN) {
-                sendWebSocketRequest(payload)
-                    .then(result => {
-                        logInfo('✅ 操作结果:', result);
-                        callback(null, result);
-                    })
-                    .catch(err => {
-                        logError('WebSocket 请求失败:', err);
-                        callback(err, null);
-                    });
-            } else if (Date.now() - startWait > 5000) {
-                logError('WebSocket 连接超时');
-                callback(new Error('WebSocket 连接超时'), null);
-            } else {
-                setTimeout(waitForConnection, 200);
-            }
-        };
-        waitForConnection();
-    }
-
-    function executePlan(plan) {
-        logInfo(`执行计划 (重试 ${retryCount}/${MAX_RETRY})`, plan);
-        callFileAPI(plan, function (err, result) {
-            if (err) {
-                logError('执行失败:', err);
-                retryCount++;
-                if (retryCount < MAX_RETRY) {
-                    const delay = retryCount * 2000;
-                    logInfo(`${delay}ms 后重试...`);
-                    setTimeout(() => executePlan(plan), delay);
-                } else {
-                    sendMessage(`[Agent] ❌ 操作失败，已重试 ${MAX_RETRY} 次。错误: ${err.message || '未知错误'}`);
-                    processing = false;
-                }
-                return;
-            }
-
-            let summary = '';
-            if (result.status === 'success') {
-                if (plan.action === 'list') {
-                    const listData = result.data || { files: [] };
-                    const files = Array.isArray(listData.files) ? listData.files : [];
-                    const total = listData.total !== undefined ? listData.total : files.length;
-                    summary = `📂 当前文件列表 (共 ${total} 个):\n` +
-                        files.map(f => `  - ${f.path} (${f.size} bytes)`).join('\n');
-                } else {
-                    const data = result.data || {};
-                    summary = `✅ 操作成功: ${plan.action} ${plan.path}\n` +
-                        `  路径: ${data.path || plan.path}\n` +
-                        (data.size ? `  大小: ${data.size} bytes` : '') +
-                        (data.content ? `\n内容预览: ${data.content}` : '');
-                }
-            } else {
-                summary = `❌ 操作失败: ${result.message || '未知错误'}`;
-            }
-
-            sendMessage(`执行结果：\n${summary}`);
-            processing = false;
         });
     }
 
@@ -395,22 +297,34 @@
             return;
         }
 
-        const plan = parsePlan(text);
-        if (plan === null) {
-            logInfo('未检测到有效计划，等待下一个响应');
-            processing = false;
-            return;
-        }
-        if (typeof plan === 'string' && plan.startsWith('JSON_ERROR')) {
-            sendMessage(plan);
-            processing = false;
-            return;
+        // 直接将回复转发给后端解析和执行
+        forwardAIResponseToBackend(text);
+    }
+
+    function forwardAIResponseToBackend(text) {
+        // 如果 WebSocket 未连接，尝试连接（sendWebSocketRequest 内部会检查）
+        if (!wsConnected) {
+            connectWebSocket();
         }
 
-        currentPlan = plan;
-        retryCount = 0;
-        logInfo('解析到计划，开始执行', plan);
-        executePlan(plan);
+        sendWebSocketRequest({content: text})
+            .then(result => {
+                logInfo('后端处理结果:', result);
+                let msg = '';
+                if (result.status === 'success') {
+                    // 可根据 result.data 定制消息，这里给出通用模板
+                    msg = '执行结果：' + JSON.stringify(result.data);
+                } else {
+                    msg = `执行结果：操作失败，${result.message || '未知错误'}`;
+                }
+                sendMessage(msg);
+                processing = false;
+            })
+            .catch(err => {
+                logError('后端处理请求失败:', err);
+                sendMessage(`执行结果：请求失败，${err.message || '未知错误'}`);
+                processing = false;
+            });
     }
 
     function setupDOMObserver() {
@@ -476,8 +390,6 @@
         logInfo('启动 Agent');
         iteration = 0;
         lastMsg = '';
-        retryCount = 0;
-        currentPlan = null;
         processing = false;
         lastProcessedText = '';
         lastFoundText = '';
@@ -522,7 +434,8 @@
         if (ws) {
             try {
                 ws.close();
-            } catch (e) {}
+            } catch (e) {
+            }
             ws = null;
         }
         wsConnected = false;
@@ -681,7 +594,7 @@
             document.addEventListener('mousemove', onMouseMove);
             document.addEventListener('mouseup', onMouseUp);
 
-            input.addEventListener('keydown', function(e) {
+            input.addEventListener('keydown', function (e) {
                 if (e.ctrlKey && e.key === 'Enter') {
                     e.preventDefault();
                     sendText();
@@ -736,5 +649,6 @@
             setTimeout(init, 2000);
         }
     }
+
     init();
 })();

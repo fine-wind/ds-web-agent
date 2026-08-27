@@ -70,7 +70,53 @@ def make_response(status, data=None, message=None):
     if message is not None:
         resp["message"] = message
     return resp
+def extract_command_from_text(text):
+    """
+    从 AI 响应文本中提取工具调用 JSON。
+    优先匹配 ```json ... ``` 代码块，否则尝试将整个文本解析为 JSON。
+    返回解析后的 dict，若失败返回 None。
+    """
+    import re
+    # 匹配 ```json ... ```
+    match = re.search(r'```json\s*([\s\S]*?)\s*```', text)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            pass
+    # 尝试直接解析整个文本
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
 
+def process_ai_response(data, request_id=None):
+    """
+    处理 AI 响应：提取命令并执行。
+    data 应包含 'content' 字段（AI 返回的完整文本），
+    或者整个 data 本身就是待解析的文本（当消息直接为字符串时，但 WebSocket 要求 JSON，所以通常会有 content）。
+    """
+    content = data.get('content')
+    if not content:
+        # 如果 data 直接就是文本，但这里 data 是 dict，所以必须有 content
+        return make_response("error", message="缺少 content 字段")
+
+    cmd = extract_command_from_text(content)
+    if not cmd:
+        return make_response("error", message="无法从 AI 响应中解析出工具调用 JSON")
+
+    # 构建标准动作数据（兼容原有字段名）
+    # 如果 cmd 中已经含有 action, path 等，直接使用；否则尝试从 type 推断
+    if 'action' not in cmd:
+        # 若 type 为 'file'，则使用 cmd 中的 action（如果有）
+        if cmd.get('type') == 'file' and 'action' in cmd:
+            # 已经包含 action
+            pass
+        else:
+            return make_response("error", message="解析出的命令缺少 action 字段")
+
+    # 现在 cmd 应包含 action、path 等，直接调用执行函数
+    return execute_action(cmd, request_id)
 # ---------- 文件操作实现 ----------
 def handle_list(data):
     offset = max(0, int(data.get('offset', 0)))
@@ -230,16 +276,25 @@ def handle_delete(full_path, recursive=False):
 
 # ---------- WebSocket 处理 ----------
 async def websocket_handler(websocket):
-    """WebSocket 统一处理端点"""
     try:
         async for message in websocket:
             try:
                 data = json.loads(message)
                 request_id = data.get('id')
-                action = data.get('action')
 
-                # 处理 prompt 动作（无需 path）
+                # ---------- 新增：处理 AI 响应（无 action） ----------
+                if 'action' not in data:
+                    # 视为 AI 响应，尝试解析并执行
+                    result = process_ai_response(data, request_id)
+                    if request_id:
+                        result['id'] = request_id
+                    await websocket.send(json.dumps(result))
+                    continue
+
+                # ---------- 原有 action 处理 ----------
+                action = data.get('action')
                 if action == 'prompt':
+                    # prompt 逻辑不变
                     try:
                         prompt = load_prompt()
                         result = make_response("success", data={"prompt": prompt})
@@ -251,112 +306,87 @@ async def websocket_handler(websocket):
                     await websocket.send(json.dumps(result))
                     continue
 
-                if action not in ['create', 'read', 'delete', 'list', 'overwrite', 'append', 'replace']:
-                    resp = make_response("error", message="不支持的 action")
-                    if request_id:
-                        resp['id'] = request_id
-                    await websocket.send(json.dumps(resp))
-                    continue
+                # 其他 action 调用统一的执行函数
+                result = execute_action(data, request_id)
+                await websocket.send(json.dumps(result))
 
-                if action == 'list':
-                    try:
-                        result = handle_list(data)
-                        if request_id:
-                            result['id'] = request_id
-                        await websocket.send(json.dumps(result))
-                    except Exception as e:
-                        logger.error(f"列表操作失败: {e}")
-                        resp = make_response("error", message=str(e))
-                        if request_id:
-                            resp['id'] = request_id
-                        await websocket.send(json.dumps(resp))
-                    continue
-
-                file_path = data.get('path')
-                if not file_path:
-                    resp = make_response("error", message="缺少 path 参数")
-                    if request_id:
-                        resp['id'] = request_id
-                    await websocket.send(json.dumps(resp))
-                    continue
-
-                try:
-                    full_path = safe_path(file_path)
-                except ValueError as e:
-                    resp = make_response("error", message=str(e))
-                    if request_id:
-                        resp['id'] = request_id
-                    await websocket.send(json.dumps(resp))
-                    continue
-
-                try:
-                    if action == 'create':
-                        content = data.get('content', '')
-                        result = handle_create(full_path, content)
-                    elif action == 'read':
-                        offset = int(data.get('offset', 0))
-                        limit = data.get('limit')
-                        if limit is not None:
-                            limit = int(limit)
-                        tail = data.get('tail', False)
-                        if tail and limit is None:
-                            limit = 10
-                        result = handle_read(full_path, offset, limit, tail)
-                    elif action == 'overwrite':
-                        content = data.get('content', '')
-                        result = handle_overwrite(full_path, content)
-                    elif action == 'append':
-                        content = data.get('content', '')
-                        result = handle_append(full_path, content)
-                    elif action == 'replace':
-                        search = data.get('search')
-                        replace = data.get('replace')
-                        if search is None or replace is None:
-                            resp = make_response("error", message="replace 操作需要提供 search 和 replace 参数")
-                            if request_id:
-                                resp['id'] = request_id
-                            await websocket.send(json.dumps(resp))
-                            continue
-                        count = data.get('count', 1)
-                        if count is not None:
-                            count = int(count)
-                        result = handle_replace(full_path, search, replace, count)
-                    elif action == 'delete':
-                        recursive = data.get('recursive', False)
-                        result = handle_delete(full_path, recursive)
-                    else:
-                        result = make_response("error", message="未知操作")
-                    if request_id:
-                        result['id'] = request_id
-                    await websocket.send(json.dumps(result))
-                except FileNotFoundError as e:
-                    resp = make_response("error", message=str(e))
-                    if request_id:
-                        resp['id'] = request_id
-                    await websocket.send(json.dumps(resp))
-                except IsADirectoryError as e:
-                    resp = make_response("error", message=str(e))
-                    if request_id:
-                        resp['id'] = request_id
-                    await websocket.send(json.dumps(resp))
-                except PermissionError as e:
-                    resp = make_response("error", message=str(e))
-                    if request_id:
-                        resp['id'] = request_id
-                    await websocket.send(json.dumps(resp))
-                except Exception as e:
-                    logger.error(f"WebSocket 操作失败: {e}")
-                    resp = make_response("error", message="内部服务器错误")
-                    if request_id:
-                        resp['id'] = request_id
-                    await websocket.send(json.dumps(resp))
             except json.JSONDecodeError:
                 await websocket.send(json.dumps(make_response("error", message="无效的 JSON")))
     except websockets.exceptions.ConnectionClosed:
         logger.info("WebSocket 连接关闭")
     except Exception as e:
         logger.error(f"WebSocket 处理异常: {e}")
+def execute_action(data, request_id=None):
+    """
+    根据 data 中的 action 执行文件操作，返回响应字典（包含 id 如果需要）
+    """
+    action = data.get('action')
+    if action not in ['create', 'read', 'delete', 'list', 'overwrite', 'append', 'replace']:
+        return make_response("error", message="不支持的 action")
 
+    if action == 'list':
+        try:
+            result = handle_list(data)
+        except Exception as e:
+            logger.error(f"列表操作失败: {e}")
+            result = make_response("error", message=str(e))
+        if request_id:
+            result['id'] = request_id
+        return result
+
+    file_path = data.get('path')
+    if not file_path:
+        return make_response("error", message="缺少 path 参数")
+    try:
+        full_path = safe_path(file_path)
+    except ValueError as e:
+        return make_response("error", message=str(e))
+
+    try:
+        if action == 'create':
+            content = data.get('content', '')
+            result = handle_create(full_path, content)
+        elif action == 'read':
+            offset = int(data.get('offset', 0))
+            limit = data.get('limit')
+            if limit is not None:
+                limit = int(limit)
+            tail = data.get('tail', False)
+            if tail and limit is None:
+                limit = 10
+            result = handle_read(full_path, offset, limit, tail)
+        elif action == 'overwrite':
+            content = data.get('content', '')
+            result = handle_overwrite(full_path, content)
+        elif action == 'append':
+            content = data.get('content', '')
+            result = handle_append(full_path, content)
+        elif action == 'replace':
+            search = data.get('search')
+            replace = data.get('replace')
+            if search is None or replace is None:
+                return make_response("error", message="replace 操作需要提供 search 和 replace 参数")
+            count = data.get('count', 1)
+            if count is not None:
+                count = int(count)
+            result = handle_replace(full_path, search, replace, count)
+        elif action == 'delete':
+            recursive = data.get('recursive', False)
+            result = handle_delete(full_path, recursive)
+        else:
+            result = make_response("error", message="未知操作")
+        if request_id:
+            result['id'] = request_id
+        return result
+    except FileNotFoundError as e:
+        return make_response("error", message=str(e))
+    except IsADirectoryError as e:
+        return make_response("error", message=str(e))
+    except PermissionError as e:
+        return make_response("error", message=str(e))
+    except Exception as e:
+        logger.error(f"操作失败: {e}")
+        return make_response("error", message="内部服务器错误")
 # ---------- 启动 WebSocket 服务 ----------
 if __name__ == '__main__':
     if websockets is None:
