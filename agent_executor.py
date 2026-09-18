@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# file name is agent_executor.py
 
 import os
 import json
 import logging
 import asyncio
-import re
-import shutil
-import tempfile
+import requests
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
+import threading
+from sandbox import TOOLS, execute_tool, SandboxConfig, CFG
 
 try:
     import websockets
@@ -21,48 +22,62 @@ WORK_DIR_ENV = os.getenv("AGENT_WORK_DIR", None)
 WS_HOST = os.getenv("AGENT_WS_HOST", "0.0.0.0")
 WS_PORT = int(os.getenv("AGENT_WS_PORT", 8765))
 
+LLAMA_HOST = os.getenv("AGENT_LLAMA_HOST", "http://127.0.0.1:9931")
+LLAMA_API_KEY = os.getenv("AGENT_LLAMA_API_KEY", "sk-no-key-required")
+LLAMA_MODEL = os.getenv("AGENT_LLAMA_MODEL", "local-model")
+LLAMA_TIMEOUT = int(os.getenv("AGENT_LLAMA_TIMEOUT", 120))
+
+AGENT_MAX_TURNS = int(os.getenv("AGENT_MAX_TURNS", 15))
+
 # ---------- 工作目录 ----------
 AGENT_DIR = Path(__file__).parent
 if WORK_DIR_ENV:
     WORK_DIR = Path(WORK_DIR_ENV).resolve()
 else:
     WORK_DIR = AGENT_DIR / "agent_workspace"
-WORK_DIR.mkdir(exist_ok=True)
+WORK_DIR.mkdir(exist_ok=True, parents=True)
 
 # ---------- 日志配置（轮转） ----------
 LOG_FILE = AGENT_DIR / "execution.log"
 logger = logging.getLogger('AgentExecutor')
 logger.setLevel(logging.INFO)
-handler = RotatingFileHandler(LOG_FILE, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')
-handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-logger.addHandler(handler)
-console = logging.StreamHandler()
-console.setLevel(logging.INFO)
-logger.addHandler(console)
+if not logger.handlers:
+    handler = RotatingFileHandler(LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5, encoding='utf-8')
+    handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logger.addHandler(handler)
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    logger.addHandler(console)
 
-# ---------- 提示词缓存 ----------
-DEFAULT_PROMPT = "你好"
-_prompt_cache = {"prompt": DEFAULT_PROMPT, "mtime": None}
+# ---------- 沙箱配置（绑定到 WORK_DIR） ----------
+CFG.root = Path(WORK_DIR).resolve()
+CFG.root.mkdir(parents=True, exist_ok=True)
+CFG.read_only = False
+CFG.allow_shell = True
+CFG.allow_python = True
+CFG.allow_network = True
+CFG.allowed_hosts = ["127.0.0.1", "localhost", "api.example.com"]  # 想完全放开就设 None
+CFG.audit_log = CFG.root / "audit.log"
 
-def load_prompt():
+def load_web_prompt():
+    """读取 prompt.md 作为系统提示词，供客户端 AI 使用。"""
     prompt_file = AGENT_DIR / "prompt.md"
     if prompt_file.exists():
-        mtime = prompt_file.stat().st_mtime
-        if _prompt_cache["mtime"] != mtime:
-            _prompt_cache["prompt"] = prompt_file.read_text(encoding='utf-8')
-            _prompt_cache["mtime"] = mtime
-        return _prompt_cache["prompt"]
-    return DEFAULT_PROMPT
+        text = prompt_file.read_text(encoding='utf-8').strip()
+        if text:
+            return text
+    return ""
 
-# ---------- 辅助函数 ----------
-def safe_path(file_path):
-    """防止路径遍历攻击"""
-    full_path = (WORK_DIR / file_path).resolve()
-    real_work = WORK_DIR.resolve()
-    if str(full_path) != str(real_work) and not str(full_path).startswith(str(real_work) + os.sep):
-        raise ValueError("非法路径")
-    return full_path
+def load_local_system_prompt():
+    """给本地 LLM 用的 system prompt。优先读 local_system.md，否则用内置。"""
+    f = AGENT_DIR / "prompt_local_llm.md"
+    if f.exists():
+        text = f.read_text(encoding='utf-8').strip()
+        if text:
+            return text
+    return ""
 
+# ---------- 响应封装 ----------
 def make_response(status, data=None, message=None):
     resp = {"status": status}
     if data is not None:
@@ -70,341 +85,236 @@ def make_response(status, data=None, message=None):
     if message is not None:
         resp["message"] = message
     return resp
-def extract_command_from_text(text):
+
+
+# ---------- 模型调用 ----------
+def chat_completion(messages,
+                    tools=None,
+                    host=None,
+                    api_key=None,
+                    model=None,
+                    temperature=0.7,
+                    stream=False,          # ← 新增
+                    timeout=None):
+    host = host or LLAMA_HOST
+    api_key = api_key or LLAMA_API_KEY
+    model = model or LLAMA_MODEL
+    timeout = timeout or LLAMA_TIMEOUT
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "stream": bool(stream),
+    }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+
+    r = requests.post(
+        f"{host}/v1/chat/completions",
+        json=payload,
+        headers=headers,
+        timeout=timeout,
+    )
+    if r.status_code >= 400:
+        body = r.text[:2000]
+        logger.error(f"LLM 返回 {r.status_code}: {body}")
+        print(f"\n❌ LLM 返回 {r.status_code}:\n{body}\n")
+        raise RuntimeError(f"LLM {r.status_code}: {body[:500]}")
+
+    if stream:
+        return r
+    return r.json()
+
+# ---------- Agent 循环 ----------
+def run_agent(chat_completion_fn, messages, max_turns=AGENT_MAX_TURNS):
     """
-    从 AI 响应文本中提取工具调用 JSON。
-    优先匹配 ```json ... ``` 代码块，否则尝试将整个文本解析为 JSON。
-    返回解析后的 dict，若失败返回 None。
+    标准 Agent 循环：
+      1. 调模型
+      2. 有 tool_calls → 执行工具，把结果塞回 messages，再循环
+      3. 无 tool_calls → 返回模型的 content 作为最终答复
     """
-    import re
-    # 匹配 ```json ... ```
-    match = re.search(r'```json\s*([\s\S]*?)\s*```', text)
-    if match:
+    for turn in range(max_turns):
+        resp = chat_completion_fn(
+            messages=messages,
+            tools=TOOLS,
+            stream=False,
+        )
+
         try:
-            return json.loads(match.group(1))
-        except json.JSONDecodeError:
-            pass
-    # 尝试直接解析整个文本
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return None
+            msg = resp["choices"][0]["message"]
+        except (KeyError, IndexError) as e:
+            logger.error(f"模型响应结构异常: {e}, resp={resp}")
+            raise RuntimeError(f"模型响应结构异常: {e}")
 
-def process_ai_response(data, request_id=None):
+        messages.append(msg)
+
+        tool_calls = msg.get("tool_calls") or []
+        if not tool_calls:
+            content = msg.get("content") or ""
+            logger.info(f"Agent 完成，共 {turn + 1} 轮，最终回复 {len(content)} 字符")
+            return content
+
+        logger.info(f"[轮次 {turn + 1}] 模型请求 {len(tool_calls)} 个工具调用")
+
+        for tc in tool_calls:
+            tc_id = tc.get("id") or f"call_{turn}"
+            fn = tc.get("function") or {}
+            name = fn.get("name")
+            args = fn.get("arguments")
+
+            logger.info(f"  → 执行工具 {name}, 参数 {str(args)[:200]}")
+
+            result = execute_tool(name, args)
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc_id,
+                "content": json.dumps(result, ensure_ascii=False),
+            })
+
+    logger.warning(f"Agent 达到最大轮次 {max_turns}，未完成。")
+    return "达到最大轮次，未完成。"
+
+
+# ---------- 核心处理：一条客户端消息 ----------
+async def handle_client_message(data, request_id):
     """
-    处理 AI 响应：提取命令并执行。
-    data 应包含 'content' 字段（AI 返回的完整文本），
-    或者整个 data 本身就是待解析的文本（当消息直接为字符串时，但 WebSocket 要求 JSON，所以通常会有 content）。
+    处理来自 WebSocket 客户端的一条消息。
+    返回 response dict（不含 id，调用方补）。
     """
+    # ---- action == 'prompt' ----
+    if data.get('action') == 'prompt':
+        try:
+            prompt = load_web_prompt()
+            return make_response("success", data={"prompt": prompt})
+        except Exception as e:
+            logger.error(f"获取提示词失败: {e}")
+            return make_response("error", message=str(e))
+
+    # ---- 其他未知 action ----
+    if 'action' in data:
+        return make_response("error", message=f"不支持的 action: {data.get('action')}")
+
+    # ---- 无 action：视为客户端回传的 AI 回复 ----
     content = data.get('content')
-    if not content:
-        # 如果 data 直接就是文本，但这里 data 是 dict，所以必须有 content
+    if content is None:
         return make_response("error", message="缺少 content 字段")
-    if content.startswith("🤖"):
-        return
-    content = content.removeprefix("json复制下载")
-    logger.info(f"解码后字符串: {content}")
-    cmd = extract_command_from_text(content)
-    if not cmd:
-        return make_response("error", message="无法从 AI 响应中解析出工具调用 JSON")
+    if not isinstance(content, str):
+        return make_response("error",
+                             message=f"content 字段类型错误: {type(content).__name__}")
+    if not content.strip():
+        # 客户端有时会在 AI 还没渲染出文本时发空内容，直接跳过
+        return make_response("skipped", message="content 为空，已跳过")
 
-    # 构建标准动作数据（兼容原有字段名）
-    # 如果 cmd 中已经含有 action, path 等，直接使用；否则尝试从 type 推断
-    if 'action' not in cmd:
-        # 若 type 为 'file'，则使用 cmd 中的 action（如果有）
-        if cmd.get('type') == 'file' and 'action' in cmd:
-            # 已经包含 action
-            pass
-        else:
-            return make_response("error", message="解析出的命令缺少 action 字段")
+    # 非操作类：以 🤖 开头且不含代码块 → 跳过，避免死循环
+    stripped = content.lstrip()
+    if stripped.startswith("🤖") and "```" not in content:
+        logger.info("AI 回复以 🤖 开头且无代码块，判定为非操作类，跳过")
+        return make_response("skipped", message="非操作类回复，已跳过")
 
-    # 现在 cmd 应包含 action、path 等，直接调用执行函数
-    return execute_action(cmd, request_id)
-# ---------- 文件操作实现 ----------
-def handle_list(data):
-    offset = max(0, int(data.get('offset', 0)))
-    limit = max(0, int(data.get('limit', 0)))   # 0 表示不限制
-    files = []
-    for root, dirs, filenames in os.walk(WORK_DIR):
-        for f in filenames:
-            full = Path(root) / f
-            rel = full.relative_to(WORK_DIR)
-            files.append({"path": str(rel), "size": full.stat().st_size})
-    files.sort(key=lambda x: x['path'])
-    total = len(files)
-    if limit > 0:
-        files = files[offset:offset+limit]
-    else:
-        files = files[offset:]
-    return make_response("success", data={"files": files, "total": total, "offset": offset, "limit": limit})
+    # ---- 组装 messages 并跑 Agent ----
+    try:
+        system_prompt = load_local_system_prompt()
+    except Exception as e:
+        logger.warning(f"加载 prompt.md 失败，使用默认: {e}")
+        system_prompt = ""
 
-def handle_create(full_path, content):
-    full_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(full_path, 'w', encoding='utf-8') as f:
-        f.write(content)
-    logger.info(f"创建文件: {full_path.relative_to(WORK_DIR)}")
-    return make_response("success", data={"path": str(full_path.relative_to(WORK_DIR)), "size": full_path.stat().st_size})
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": content},
+    ]
 
-def handle_read(full_path, offset=0, limit=None, tail=False):
-    if not full_path.exists():
-        raise FileNotFoundError(f"文件不存在: {full_path.relative_to(WORK_DIR)}")
-    if full_path.is_dir():
-        raise IsADirectoryError(f"路径是目录，不能读取: {full_path.relative_to(WORK_DIR)}")
+    logger.info(f"开始 Agent 循环，用户消息 {len(content)} 字符")
 
-    MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
-    if full_path.stat().st_size > MAX_FILE_SIZE:
-        raise ValueError(f"文件过大，拒绝读取（最大允许 {MAX_FILE_SIZE // (1024*1024)}MB）: {full_path.relative_to(WORK_DIR)}")
+    try:
+        final_reply = await asyncio.to_thread(
+            run_agent, chat_completion, messages, AGENT_MAX_TURNS
+        )
+        if not isinstance(final_reply, str):
+            final_reply = json.dumps(final_reply, ensure_ascii=False)
+        return make_response("success", data=final_reply)
+    except Exception as e:
+        logger.error(f"Agent 执行异常: {e}", exc_info=True)
+        return make_response("error", message=f"Agent 执行失败: {e}")
 
-    with open(full_path, 'r', encoding='utf-8') as f:
-        lines = f.readlines()
-
-    total_lines = len(lines)
-
-    if tail:
-        if limit is None:
-            limit = 10
-        start = max(0, total_lines - limit)
-        selected = lines[start:]
-    else:
-        start = max(0, offset)
-        if limit is not None and limit > 0:
-            end = min(start + limit, total_lines)
-            selected = lines[start:end]
-        else:
-            selected = lines[start:]
-
-    selected_text = ''.join(selected)
-    return make_response("success", data={
-        "path": str(full_path.relative_to(WORK_DIR)),
-        "content": selected_text,
-        "total_lines": total_lines,
-        "returned_lines": len(selected),
-        "offset": start,
-        "limit": limit,
-        "tail": tail
-    })
-
-def handle_overwrite(full_path, content):
-    if not full_path.exists():
-        raise FileNotFoundError(f'文件不存在: {full_path.relative_to(WORK_DIR)}')
-    if full_path.is_dir():
-        raise IsADirectoryError(f'路径是目录，不能执行此操作: {full_path.relative_to(WORK_DIR)}')
-    with open(full_path, 'w', encoding='utf-8') as f:
-        f.write(content or '')
-    logger.info(f"覆盖文件: {full_path.relative_to(WORK_DIR)}")
-    return make_response("success", data={"path": str(full_path.relative_to(WORK_DIR)), "size": full_path.stat().st_size})
-
-def handle_append(full_path, content):
-    if not full_path.exists():
-        raise FileNotFoundError(f'文件不存在: {full_path.relative_to(WORK_DIR)}')
-    if full_path.is_dir():
-        raise IsADirectoryError(f'路径是目录，不能执行此操作: {full_path.relative_to(WORK_DIR)}')
-    with open(full_path, 'a', encoding='utf-8') as f:
-        f.write(content or '')
-    logger.info(f"追加文件: {full_path.relative_to(WORK_DIR)}")
-    return make_response("success", data={"path": str(full_path.relative_to(WORK_DIR)), "size": full_path.stat().st_size})
-
-def handle_replace(full_path, search, replace, count=1):
-    if not full_path.exists():
-        raise FileNotFoundError(f'文件不存在: {full_path.relative_to(WORK_DIR)}')
-    if full_path.is_dir():
-        raise IsADirectoryError(f'路径是目录，不能执行此操作: {full_path.relative_to(WORK_DIR)}')
-
-    if count == 0:
-        logger.info(f"替换操作跳过（count=0）: {full_path.relative_to(WORK_DIR)}")
-        return make_response("success", data={
-            "path": str(full_path.relative_to(WORK_DIR)),
-            "size": full_path.stat().st_size,
-            "replaced_count": 0,
-            "search": search,
-            "replace": replace,
-            "count": count
-        })
-    MAX_FILE_SIZE = 50 * 1024 * 1024
-    if full_path.stat().st_size > MAX_FILE_SIZE:
-        raise ValueError(f'文件过大，拒绝读取（最大允许 {MAX_FILE_SIZE // (1024*1024)}MB）: {full_path.relative_to(WORK_DIR)}')
-    with open(full_path, 'r', encoding='utf-8') as f:
-        content = f.read()
-    pattern = re.compile(re.escape(search))
-    re_count = count if count > 0 else 0
-    new_content, replaced_count = pattern.subn(replace, content, count=re_count)
-    if replaced_count > 0:
-        with open(full_path, 'w', encoding='utf-8') as f:
-            f.write(new_content)
-        logger.info(f'替换文件: {full_path.relative_to(WORK_DIR)}，替换次数: {replaced_count}')
-    else:
-        logger.info(f'替换操作无匹配: {full_path.relative_to(WORK_DIR)}')
-    return make_response('success', data={
-        'path': str(full_path.relative_to(WORK_DIR)),
-        'size': full_path.stat().st_size,
-        'replaced_count': replaced_count,
-        'search': search,
-        'replace': replace,
-        'count': count
-    })
-
-def handle_delete(full_path, recursive=False):
-    if not full_path.exists():
-        raise FileNotFoundError(f"文件不存在: {full_path.relative_to(WORK_DIR)}")
-    if full_path.is_dir():
-        if recursive:
-            for root, dirs, files in os.walk(full_path):
-                for name in dirs + files:
-                    p = Path(root) / name
-                    if p.is_symlink():
-                        raise ValueError(f'目录内包含符号链接，禁止递归删除: {p.relative_to(WORK_DIR)}')
-            shutil.rmtree(full_path)
-            logger.info(f"递归删除目录: {full_path.relative_to(WORK_DIR)}")
-            return make_response("success", data={"path": str(full_path.relative_to(WORK_DIR)), "deleted": True, "recursive": True})
-        else:
-            raise IsADirectoryError(f"路径是目录，不允许删除（设置 recursive=true 可强制删除）: {full_path.relative_to(WORK_DIR)}")
-    else:
-        if full_path.is_symlink():
-            raise ValueError('不允许删除符号链接')
-        full_path.unlink()
-        logger.info(f"删除文件: {full_path.relative_to(WORK_DIR)}")
-        return make_response("success", data={"path": str(full_path.relative_to(WORK_DIR)), "deleted": True})
 
 # ---------- WebSocket 处理 ----------
 async def websocket_handler(websocket):
     try:
         async for message in websocket:
-            # ---------- 打印原始消息（调试） ----------
-            logger.info(f"收到消息类型: {type(message)}")
+            # 二进制帧兼容
             if isinstance(message, bytes):
-                # 二进制帧，尝试用 UTF-8 解码
                 try:
-                    decoded = message.decode('utf-8')
-                    logger.info(f"原始字节 (repr): {repr(message)}")
-                    logger.info(f"解码后字符串: {decoded}")
+                    message = message.decode('utf-8')
                 except UnicodeDecodeError:
-                    logger.error(f"无法用 UTF-8 解码收到的二进制数据: {repr(message)}")
-            else:
-                # 文本帧，直接是 str
-                logger.info(f"收到文本消息: {repr(message)}")
+                    logger.error(f"无法用 UTF-8 解码二进制数据: {message!r}")
+                    await websocket.send(json.dumps(
+                        make_response("error", message="无法解码二进制消息"),
+                        ensure_ascii=False))
+                    continue
+
+            # 解析 JSON
             try:
                 data = json.loads(message)
-                request_id = data.get('id')
-
-                # ---------- 新增：处理 AI 响应（无 action） ----------
-                if 'action' not in data:
-                    # 视为 AI 响应，尝试解析并执行
-                    result = process_ai_response(data, request_id)
-                    if result is None:
-                        continue
-                    if request_id:
-                        result['id'] = request_id
-                    await websocket.send(json.dumps(result))
-                    continue
-
-                # ---------- 原有 action 处理 ----------
-                action = data.get('action')
-                if action == 'prompt':
-                    # prompt 逻辑不变
-                    try:
-                        prompt = load_prompt()
-                        result = make_response("success", data={"prompt": prompt})
-                    except Exception as e:
-                        logger.error(f"获取提示词失败: {e}")
-                        result = make_response("error", message=str(e))
-                    if request_id:
-                        result['id'] = request_id
-                    await websocket.send(json.dumps(result))
-                    continue
-
-                # 其他 action 调用统一的执行函数
-                result = execute_action(data, request_id)
-                await websocket.send(json.dumps(result))
-
             except json.JSONDecodeError:
-                await websocket.send(json.dumps(make_response("error", message="无效的 JSON")))
+                await websocket.send(json.dumps(
+                    make_response("error", message="无效的 JSON"),
+                    ensure_ascii=False))
+                continue
+
+            if not isinstance(data, dict):
+                await websocket.send(json.dumps(
+                    make_response("error", message="JSON 消息必须是对象"),
+                    ensure_ascii=False))
+                continue
+
+            request_id = data.get('id')
+
+            try:
+                result = await handle_client_message(data, request_id)
+            except Exception as e:
+                logger.error(f"处理单条消息异常: {e}", exc_info=True)
+                result = make_response("error", message=f"内部错误: {e}")
+
+            if result is None:
+                continue
+            if request_id is not None:
+                result['id'] = request_id
+
+            try:
+                await websocket.send(json.dumps(result, ensure_ascii=False))
+            except Exception as e:
+                logger.error(f"发送响应失败: {e}")
+
     except websockets.exceptions.ConnectionClosed:
         logger.info("WebSocket 连接关闭")
     except Exception as e:
-        logger.error(f"WebSocket 处理异常: {e}")
-def execute_action(data, request_id=None):
-    """
-    根据 data 中的 action 执行文件操作，返回响应字典（包含 id 如果需要）
-    """
-    action = data.get('action')
-    if action not in ['create', 'read', 'delete', 'list', 'overwrite', 'append', 'replace']:
-        return make_response("error", message="不支持的 action")
+        logger.error(f"WebSocket 处理异常: {e}", exc_info=True)
 
-    if action == 'list':
-        try:
-            result = handle_list(data)
-        except Exception as e:
-            logger.error(f"列表操作失败: {e}")
-            result = make_response("error", message=str(e))
-        if request_id:
-            result['id'] = request_id
-        return result
 
-    file_path = data.get('path')
-    if not file_path:
-        return make_response("error", message="缺少 path 参数")
-    try:
-        full_path = safe_path(file_path)
-    except ValueError as e:
-        return make_response("error", message=str(e))
-
-    try:
-        if action == 'create':
-            content = data.get('content', '')
-            result = handle_create(full_path, content)
-        elif action == 'read':
-            offset = int(data.get('offset', 0))
-            limit = data.get('limit')
-            if limit is not None:
-                limit = int(limit)
-            tail = data.get('tail', False)
-            if tail and limit is None:
-                limit = 10
-            result = handle_read(full_path, offset, limit, tail)
-        elif action == 'overwrite':
-            content = data.get('content', '')
-            result = handle_overwrite(full_path, content)
-        elif action == 'append':
-            content = data.get('content', '')
-            result = handle_append(full_path, content)
-        elif action == 'replace':
-            search = data.get('search')
-            replace = data.get('replace')
-            if search is None or replace is None:
-                return make_response("error", message="replace 操作需要提供 search 和 replace 参数")
-            count = data.get('count', 1)
-            if count is not None:
-                count = int(count)
-            result = handle_replace(full_path, search, replace, count)
-        elif action == 'delete':
-            recursive = data.get('recursive', False)
-            result = handle_delete(full_path, recursive)
-        else:
-            result = make_response("error", message="未知操作")
-        if request_id:
-            result['id'] = request_id
-        return result
-    except FileNotFoundError as e:
-        return make_response("error", message=str(e))
-    except IsADirectoryError as e:
-        return make_response("error", message=str(e))
-    except PermissionError as e:
-        return make_response("error", message=str(e))
-    except Exception as e:
-        logger.error(f"操作失败: {e}")
-        return make_response("error", message="内部服务器错误")
 # ---------- 启动 WebSocket 服务 ----------
 if __name__ == '__main__':
     if websockets is None:
         print("❌ 未安装 websockets 库，请执行: pip install websockets")
         exit(1)
 
-    print(f"🚀 Agent WebSocket 服务启动")
-    print(f"📁 工作目录: {WORK_DIR}")
+    print("🚀 Agent WebSocket 服务启动")
+    print(f"📁 工作目录 (沙箱根): {WORK_DIR}")
     print(f"🔌 WebSocket 监听地址: {WS_HOST}:{WS_PORT}")
+    print(f"🧠 模型接口: {LLAMA_HOST}  model={LLAMA_MODEL}")
     print(f"📋 日志文件: {LOG_FILE} (轮转: 10MB/5备份)")
-    prompt_file = AGENT_DIR / "prompt.md"
-    print(f"📝 提示词来源: {prompt_file if prompt_file.exists() else '内置默认'}")
+    web_prompt_file = AGENT_DIR / "prompt.md"
+    local_prompt_file = AGENT_DIR / "prompt_local_llm.md"
+    print(f"📝 网页 AI 提示词: {web_prompt_file if web_prompt_file.exists() else '内置默认'}")
+    print(f"🧠 本地 LLM 提示词: {local_prompt_file if local_prompt_file.exists() else '内置默认'}")
+    print(f"🧰 沙箱允许的主机: {CFG.allowed_hosts}")
+    print(f"🧰 沙箱 shell 白名单: {CFG.shell_whitelist}")
 
     async def start_ws():
         async with websockets.serve(websocket_handler, WS_HOST, WS_PORT):
