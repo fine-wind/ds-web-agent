@@ -1,5 +1,6 @@
 // ==UserScript==
 // @name         DeepSeek Agent (基于 WebSocket)
+// @icon         https://fe-static.deepseek.com/chat/favicon.svg
 // @namespace    http://tampermonkey.net/
 // @version      10.1
 // @description  无遮罩、无标题、透明背景模态框，拖动整个空白区域；全部通信走 WebSocket，获取提示词失败弹框确认
@@ -26,41 +27,73 @@
     let wsRequestId = 0;
     const pendingRequests = new Map();
     let wsReconnectTimer = null;
+    // DOM 观察器
+    let observerTimer = null;
+    const box = document.createElement('div');
+    box.style.cssText = `position: fixed;right: 20px;bottom: 20px;display: flex;flex-direction: column;gap: 10px;z-index: 9999;`;
+    document.body.appendChild(box);
+
+    function toast({type = 'info', ms = 3000} = {}, ...msg) {
+        const colors = {
+            info: '#333',
+            error: '#c62828',
+            success: '#2e7d32',
+            warning: '#ef6c00'
+        };
+        const bg = colors[type] || colors.info;
+
+        const div = document.createElement('div');
+        div.textContent = msg.join(", ");
+        div.style.cssText = `padding: 12px 16px;background: ${bg};color: #fff;border-radius: 8px;font-size: 14px;opacity: 0;transform: translateY(20px);transition: opacity .3s, transform .3s;`;
+        box.appendChild(div);
+
+        requestAnimationFrame(() => {
+            div.style.opacity = 1;
+            div.style.transform = 'translateY(0)';
+        });
+
+        setTimeout(() => {
+            div.style.opacity = 0;
+            div.style.transform = 'translateY(20px)';
+            setTimeout(() => div.remove(), 300);
+        }, ms);
+    }
 
     // ============ 日志工具 ============
     function logInfo(...args) {
         console.log('[Agent]', ...args);
+        toast({}, ...args);
     }
 
     function logWarn(...args) {
         console.warn('[Agent]', ...args);
+        toast({type: "warning"}, ...args);
     }
 
     function logError(...args) {
         console.error('[Agent]', ...args);
+        toast({type: "error"}, ...args);
     }
 
-    // DOM 观察器
-    let observerTimer = null;
 
     // ============ 通过虚拟列表 key 获取最新 AI 消息 ============
     function getLatestAIMessage() {
         let items = document.querySelectorAll('[data-virtual-list-item-key]');
-
+        if (!items.length) return null;
 
         let item = items[items.length - 1];
         let key = item.dataset.virtualListItemKey;
         let latest = key % 2 === 0 ? item : null;
-
+        if (!latest) return null;
         let childNode = latest.querySelectorAll(':scope > .ds-message')[0];
+        childNode = childNode.querySelectorAll(':scope > .ds-assistant-message-main-content')[0];
         let text = childNode?.innerText?.trim()
         return {text, childNode, key};
     }
 
-    top.window.debugAgent = getLatestAIMessage;
 
     function sendMessage(text) {
-        logInfo('📤 发送消息:', text.slice(0, 200) + (text.length > 200 ? '...' : ''));
+        logInfo('📤 发送消息:', text.slice(0, 20) + '...');
         const ta = document.querySelector('textarea[placeholder*="发送消息"]');
         if (!ta) {
             logError('未找到输入框');
@@ -201,7 +234,7 @@
 
             try {
                 ws.send(JSON.stringify(message));
-                logInfo(`🚀 WebSocket 发送: ${JSON.stringify(payload).slice(0, 100)}`);
+                logInfo(`🚀 WebSocket发送: ${JSON.stringify(payload).slice(0, 20)}`);
             } catch (e) {
                 clearTimeout(timeout);
                 pendingRequests.delete(id);
@@ -284,17 +317,17 @@
                 return;
             }
             if (lastOver) {
-                logInfo(lastAIMessageKey, `文本稳定 → 判定回复完毕`)
+                toast({ms: 1000}, lastAIMessageKey + ` 文本稳定 → 判定回复完毕`);
                 return;
             }
 
             textRound++;
             if (textRound < SILENT_TEXT_ROUND) {
-                logInfo(lastAIMessageKey, `轮次未到，继续等待 ${textRound}/${SILENT_TEXT_ROUND}`)
+                logInfo(lastAIMessageKey + ` 轮次未到，继续等待 ${textRound}/${SILENT_TEXT_ROUND}`)
             }
 
             if (!isRunning || processing) {
-                logInfo(lastAIMessageKey, `运行状态：${isRunning}`, `任务状态：${isRunning}`)
+                logInfo(lastAIMessageKey + `运行状态：${isRunning}`, `任务状态：${isRunning}`)
                 return;
             }
 
@@ -302,7 +335,7 @@
             processing = true;
             iteration++;
 
-            logInfo(lastAIMessageKey, 'AI 回复内容预览:', `(长度: ${finalText.length})`, `${lastProcessedText.slice(0, 20)}...${lastProcessedText.slice(-20)}`);
+            logInfo(lastAIMessageKey + 'AI 回复内容预览:', `(长度: ${finalText.length})`, `${lastProcessedText.slice(0, 20)}...${lastProcessedText.slice(-20)}`);
 
             if (!wsConnected) connectWebSocket();
 
@@ -328,40 +361,35 @@
                         } else {
                             dataStr = String(data);
                         }
-                        const MAX_LEN = 8000;
-                        if (dataStr.length > MAX_LEN) {
-                            dataStr = dataStr.slice(0, MAX_LEN)
-                                + `\n...（已截断，原始长度 ${dataStr.length} 字符）`;
-                        }
-                        msg = '执行结果：' + dataStr;
+                        msg = dataStr;
+                        sendMessage(msg);
                     } else {
                         msg = `执行结果：操作失败，${result.message || '未知错误'}`;
                         // 出错时允许重新处理同一 AI 消息
                         lastOver = false;
+                        stopDOMObserver();
                     }
-                    sendMessage(msg);
                     processing = false;
-                    setupDOMObserver();
                 })
                 .catch(err => {
                     logError('后端处理请求失败:', err);
                     lastOver = false;
                     processing = false;
                 });
-            stopDOMObserver();
         }, SILENT_WAIT);
 
         logInfo(lastAIMessageKey, `监听 AI 回复已启动（周期 ${SILENT_WAIT}ms）`);
     }
 
     function sendPromptOnce(prompt) {
-        const pathname = location.pathname.length > 10 ? location.pathname : Math.random().toString();
-        if (!localStorage.getItem('agent_prompt_sent' + pathname)) {
-            localStorage.setItem('agent_prompt_sent' + pathname, 'true');
+        let pathname = location.pathname;
+        let key = 'agent_prompt_sent' + pathname;
+        if (pathname.length < 10) {
+            sendMessage(prompt);
+            logInfo('系统提示词已发送');
             setTimeout(() => {
-                sendMessage(prompt);
-                logInfo('系统提示词已发送');
-            }, 1500);
+                localStorage.setItem('agent_prompt_sent' + location.pathname, 'true');
+            }, 3000)
         }
     }
 
@@ -379,19 +407,10 @@
                     sendPromptOnce(prompt);
                 })
                 .catch(err => {
-                    logWarn('获取提示词失败:', err);
-                    const useDefault = confirm(
-                        '获取服务端提示词失败，是否使用内置默认提示词继续？\n\n' +
-                        '错误信息：' + (err.message || '未知错误')
-                    );
-                    if (useDefault) {
-                        sendPromptOnce(DEFAULT_PROMPT);
-                    } else {
-                        stopAgent();
-                    }
+                    logError('获取提示词失败:' + err);
+                    stopAgent();
                 });
         }
-
         setupDOMObserver();
     }
 
@@ -441,8 +460,8 @@
 
         const container = document.createElement('div');
         container.className = 'agent-float-container';
-        container.style.cssText = 'position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: 9999; display: flex; gap: 8px; cursor: move; user-select: none;';
-        document.body.appendChild(container);
+        container.style.cssText = 'display: flex;cursor: move; user-select: none;';
+        document.querySelectorAll('.ds-toggle-button')[0].parentElement.appendChild(container);
 
         // ---- Agent 开关按钮 ----
         const btn = document.createElement('div');
@@ -475,145 +494,7 @@
             }
         });
 
-        // ---- 重置/输入按钮 ----
-        const resetBtn = document.createElement('div');
-        resetBtn.className = 'agent-reset-btn';
-        resetBtn.style.cssText = 'cursor: pointer; padding: 6px 10px; background: #ffffff; border-radius: 18px; display: flex; align-items: center; gap: 6px; box-shadow: 0 2px 8px rgba(0,0,0,0.2);';
-        resetBtn.setAttribute('role', 'button');
-        resetBtn.innerHTML = `<span style="font-size:13px;">📝 重置</span>`;
-
-        resetBtn.addEventListener('click', function (e) {
-            e.stopPropagation();
-
-            const modal = document.createElement('div');
-            modal.style.cssText = `position: fixed;bottom: 20%;left: 50%;transform: translateX(-50%);background: transparent;padding: 0;z-index: 10001;display: flex;flex-direction: column;gap: 8px;align-items: center;color: #222;cursor: move;`;
-
-            const input = document.createElement('textarea');
-            input.placeholder = '输入要发送的内容... (Ctrl+Enter 发送)';
-            input.style.cssText = `background: white;width: 400px;max-width: 90vw;height: 120px;padding: 12px 14px;font-size: 14px;border-radius: 8px;border: 1px solid #ccc;resize: none;color: #222;outline: none;box-shadow: 0 2px 10px rgba(0,0,0,0.15);box-sizing: border-box;`;
-
-            const btnContainer = document.createElement('div');
-            btnContainer.style.cssText = 'display: flex; gap: 10px; justify-content: flex-end; align-items: center; width: 100%;';
-
-            const dragHint = document.createElement('span');
-            dragHint.textContent = '⬇️ 拖动移动';
-            dragHint.style.cssText = 'color: #555; font-size: 13px; margin-right: auto; cursor: move; background: rgba(255,255,255,0.8); padding: 2px 8px; border-radius: 12px;';
-
-            const sendBtn = document.createElement('button');
-            sendBtn.textContent = '发送 (Ctrl+Enter)';
-            sendBtn.style.cssText = `padding: 8px 20px;cursor: pointer;border: none;border-radius: 8px;background: #3964fe;color: white;font-size: 14px;font-weight: 500;transition: background 0.2s;box-shadow: 0 2px 6px rgba(0,0,0,0.1);`;
-            sendBtn.addEventListener('mouseenter', () => sendBtn.style.background = '#2b4fc7');
-            sendBtn.addEventListener('mouseleave', () => sendBtn.style.background = '#3964fe');
-
-            const closeBtn = document.createElement('button');
-            closeBtn.textContent = '取消';
-            closeBtn.style.cssText = `padding: 8px 20px;cursor: pointer;border: none;border-radius: 8px;background: #6b7280;color: white;font-size: 14px;transition: background 0.2s;box-shadow: 0 2px 6px rgba(0,0,0,0.1);`;
-            closeBtn.addEventListener('mouseenter', () => closeBtn.style.background = '#4b5563');
-            closeBtn.addEventListener('mouseleave', () => closeBtn.style.background = '#6b7280');
-
-            btnContainer.appendChild(dragHint);
-            btnContainer.appendChild(sendBtn);
-            btnContainer.appendChild(closeBtn);
-
-            modal.appendChild(input);
-            modal.appendChild(btnContainer);
-
-            function closeModal() {
-                modal.remove();
-                document.removeEventListener('mousemove', onMouseMove);
-                document.removeEventListener('mouseup', onMouseUp);
-            }
-
-            function sendText() {
-                const text = input.value.trim();
-                if (text) {
-                    iteration = 0;
-                    processing = false;
-                    sendMessage(text);
-                    logInfo('已发送输入内容并重置步骤');
-                    input.value = '';
-                    input.focus();
-                }
-            }
-
-            let isDragging = false;
-            let startX, startY, origLeft, origTop;
-
-            function onMouseMove(e) {
-                if (!isDragging) return;
-                const dx = e.clientX - startX;
-                const dy = e.clientY - startY;
-                modal.style.left = (origLeft + dx) + 'px';
-                modal.style.top = (origTop + dy) + 'px';
-            }
-
-            function onMouseUp() {
-                isDragging = false;
-            }
-
-            modal.addEventListener('mousedown', function (e) {
-                const target = e.target;
-                if (target.closest('textarea') || target.closest('button')) return;
-                isDragging = true;
-                startX = e.clientX;
-                startY = e.clientY;
-                const rect = modal.getBoundingClientRect();
-                modal.style.left = rect.left + 'px';
-                modal.style.top = rect.top + 'px';
-                modal.style.transform = 'none';
-                origLeft = rect.left;
-                origTop = rect.top;
-                e.preventDefault();
-            });
-
-            document.addEventListener('mousemove', onMouseMove);
-            document.addEventListener('mouseup', onMouseUp);
-
-            input.addEventListener('keydown', function (e) {
-                if (e.ctrlKey && e.key === 'Enter') {
-                    e.preventDefault();
-                    sendText();
-                }
-            });
-
-            sendBtn.addEventListener('click', sendText);
-            closeBtn.addEventListener('click', closeModal);
-
-            document.body.appendChild(modal);
-            input.focus();
-        });
-
         container.appendChild(btn);
-        container.appendChild(resetBtn);
-
-        let isDraggingContainer = false;
-        let startXc, startYc, origXc, origYc;
-
-        container.addEventListener('mousedown', function (e) {
-            if (e.target === container) {
-                isDraggingContainer = true;
-                startXc = e.clientX;
-                startYc = e.clientY;
-                const rect = container.getBoundingClientRect();
-                origXc = rect.left;
-                origYc = rect.top;
-                e.preventDefault();
-            }
-        });
-
-        document.addEventListener('mousemove', function (e) {
-            if (!isDraggingContainer) return;
-            const dx = e.clientX - startXc;
-            const dy = e.clientY - startYc;
-            container.style.left = (origXc + dx) + 'px';
-            container.style.top = (origYc + dy) + 'px';
-            container.style.right = 'auto';
-            container.style.bottom = 'auto';
-        });
-
-        document.addEventListener('mouseup', function () {
-            isDraggingContainer = false;
-        });
     }
 
     // ============ 初始化 ============
@@ -624,6 +505,9 @@
             setTimeout(init, 2000);
         }
     }
+
+    top.window.getLatestAIMessage = getLatestAIMessage;
+    top.window.sendMessage = sendMessage;
 
     init();
 })();

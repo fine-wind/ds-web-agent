@@ -27,8 +27,6 @@ LLAMA_API_KEY = os.getenv("AGENT_LLAMA_API_KEY", "sk-no-key-required")
 LLAMA_MODEL = os.getenv("AGENT_LLAMA_MODEL", "local-model")
 LLAMA_TIMEOUT = int(os.getenv("AGENT_LLAMA_TIMEOUT", 600))
 
-AGENT_MAX_TURNS = int(os.getenv("AGENT_MAX_TURNS", 20))
-
 # ---------- 工作目录 ----------
 AGENT_DIR = Path(__file__).parent
 if WORK_DIR_ENV:
@@ -132,54 +130,63 @@ def chat_completion(messages,
     return r.json()
 
 # ---------- Agent 循环 ----------
-def run_agent(chat_completion_fn, messages, max_turns=AGENT_MAX_TURNS):
+def run_agent_once(chat_completion_fn, messages):
     """
-    标准 Agent 循环：
-      1. 调模型
-      2. 有 tool_calls → 执行工具，把结果塞回 messages，再循环
-      3. 无 tool_calls → 返回模型的 content 作为最终答复
+    单轮工具模式：
+      1. 调模型，拿到 tool_calls
+      2. 执行所有工具
+      3. 直接返回工具执行结果，不再回传给模型
+      4. 若模型没有请求工具，则直接返回它的文本回复
     """
-    for turn in range(max_turns):
-        resp = chat_completion_fn(
-            messages=messages,
-            tools=TOOLS,
-            stream=False,
-        )
+    resp = chat_completion_fn(
+        messages=messages,
+        tools=TOOLS,
+        stream=False,
+    )
+
+    try:
+        msg = resp["choices"][0]["message"]
+    except (KeyError, IndexError) as e:
+        logger.error(f"模型响应结构异常: {e}, resp={resp}")
+        raise RuntimeError(f"模型响应结构异常: {e}")
+
+    tool_calls = msg.get("tool_calls") or []
+
+    # ---- 情况 A：模型没有请求工具，直接返回文本 ----
+    if not tool_calls:
+        content = msg.get("content") or ""
+        logger.info(f"模型未请求工具，直接返回文本 {len(content)} 字符")
+        return {
+            "type": "text",
+            "content": content,
+        }
+
+    # ---- 情况 B：模型请求了工具，逐个执行，收集结果 ----
+    logger.info(f"模型请求 {len(tool_calls)} 个工具调用，开始执行")
+
+    results = []
+    for idx, tc in enumerate(tool_calls):
+        tc_id = tc.get("id") or f"call_{idx}"
+        fn = tc.get("function") or {}
+        name = fn.get("name")
+        args = fn.get("arguments")
+
+        logger.info(f"  → 执行工具 {name}, 参数 {str(args)[:200]}")
 
         try:
-            msg = resp["choices"][0]["message"]
-        except (KeyError, IndexError) as e:
-            logger.error(f"模型响应结构异常: {e}, resp={resp}")
-            raise RuntimeError(f"模型响应结构异常: {e}")
-
-        messages.append(msg)
-
-        tool_calls = msg.get("tool_calls") or []
-        if not tool_calls:
-            content = msg.get("content") or ""
-            logger.info(f"Agent 完成，共 {turn + 1} 轮，最终回复 {len(content)} 字符")
-            return content
-
-        logger.info(f"[轮次 {turn + 1}] 模型请求 {len(tool_calls)} 个工具调用")
-
-        for tc in tool_calls:
-            tc_id = tc.get("id") or f"call_{turn}"
-            fn = tc.get("function") or {}
-            name = fn.get("name")
-            args = fn.get("arguments")
-
-            logger.info(f"  → 执行工具 {name}, 参数 {str(args)[:200]}")
-
             result = execute_tool(name, args)
+        except Exception as e:
+            logger.error(f"工具 {name} 执行失败: {e}", exc_info=True)
+            result = {"error": str(e)}
 
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc_id,
-                "content": json.dumps(result, ensure_ascii=False),
-            })
+        results.append(result)
 
-    logger.warning(f"Agent 达到最大轮次 {max_turns}，未完成。")
-    return "达到最大轮次，未完成。"
+    logger.info(f"工具全部执行完毕，共 {len(results)} 个，直接返回结果")
+
+    return {
+        "type": "tools",
+        "tool_calls": results,
+    }
 
 
 # ---------- 核心处理：一条客户端消息 ----------
@@ -233,12 +240,15 @@ async def handle_client_message(data, request_id):
     logger.info(f"开始 Agent 循环，用户消息 {len(content)} 字符")
 
     try:
-        final_reply = await asyncio.to_thread(
-            run_agent, chat_completion, messages, AGENT_MAX_TURNS
-        )
-        if not isinstance(final_reply, str):
-            final_reply = json.dumps(final_reply, ensure_ascii=False)
-        return make_response("success", data=final_reply)
+        outcome = await asyncio.to_thread(run_agent_once, chat_completion, messages)
+
+        if outcome["type"] == "text":
+            # 模型没调工具，直接返回文本
+            return make_response("success", data=outcome["content"])
+
+        # 模型调了工具，返回工具执行结果
+        return make_response("success", data=outcome["tool_calls"])
+
     except Exception as e:
         logger.error(f"Agent 执行异常: {e}", exc_info=True)
         return make_response("error", message=f"Agent 执行失败: {e}")
