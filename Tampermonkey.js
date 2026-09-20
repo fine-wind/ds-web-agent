@@ -45,15 +45,15 @@
 
     // ============ 通过虚拟列表 key 获取最新 AI 消息 ============
     function getLatestAIMessage() {
-        const items = document.querySelectorAll('[data-virtual-list-item-key]');
-        if (!items.length) return null;
+        let items = document.querySelectorAll('[data-virtual-list-item-key]');
+
 
         let item = items[items.length - 1];
         let key = item.dataset.virtualListItemKey;
-        const latest = key % 2 === 0 ? item : null;
-        if (!latest) return null;
-        let childNode = latest.childNodes[0]?.childNodes[1];
-        const text = childNode?.innerText?.trim()
+        let latest = key % 2 === 0 ? item : null;
+
+        let childNode = latest.querySelectorAll(':scope > .ds-message')[0];
+        let text = childNode?.innerText?.trim()
         return {text, childNode, key};
     }
 
@@ -83,30 +83,28 @@
             ta.dispatchEvent(new Event('compositionend', {bubbles: true}));
         }
 
-        setTimeout(() => {
-            let sendBtn = document.querySelector('div[role="button"].ds-button--primary.ds-button--circle:not(.ds-button--disabled)');
-            if (!sendBtn) {
-                const svg = document.querySelector('svg path[d*="M8.3125 0.981587"]');
-                if (svg) {
-                    const parent = svg.closest('div[role="button"]');
-                    if (parent && !parent.classList.contains('ds-button--disabled')) sendBtn = parent;
+        let sendBtn = document.querySelector('div[role="button"].ds-button--primary.ds-button--circle:not(.ds-button--disabled)');
+        if (!sendBtn) {
+            const svg = document.querySelector('svg path[d*="M8.3125 0.981587"]');
+            if (svg) {
+                const parent = svg.closest('div[role="button"]');
+                if (parent && !parent.classList.contains('ds-button--disabled')) sendBtn = parent;
+            }
+        }
+        if (sendBtn) {
+            sendBtn.click();
+            logInfo('✅ 点击发送按钮');
+            setTimeout(() => {
+                if (ta.value !== '') {
+                    ta.value = '';
+                    ta.dispatchEvent(new Event('input', {bubbles: true}));
                 }
-            }
-            if (sendBtn) {
-                sendBtn.click();
-                logInfo('✅ 点击发送按钮');
-                setTimeout(() => {
-                    if (ta.value !== '') {
-                        ta.value = '';
-                        ta.dispatchEvent(new Event('input', {bubbles: true}));
-                    }
-                }, 100);
-            } else {
-                ta.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true}));
-                ta.dispatchEvent(new KeyboardEvent('keyup', {key: 'Enter', bubbles: true}));
-                logInfo('⚠️ 未找到发送按钮，模拟 Enter 键');
-            }
-        }, 400);
+            }, 100);
+        } else {
+            ta.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true}));
+            ta.dispatchEvent(new KeyboardEvent('keyup', {key: 'Enter', bubbles: true}));
+            logInfo('⚠️ 未找到发送按钮，模拟 Enter 键');
+        }
     }
 
     // ============ WebSocket 客户端 ============
@@ -343,12 +341,14 @@
                     }
                     sendMessage(msg);
                     processing = false;
+                    setupDOMObserver();
                 })
                 .catch(err => {
                     logError('后端处理请求失败:', err);
                     lastOver = false;
                     processing = false;
                 });
+            stopDOMObserver();
         }, SILENT_WAIT);
 
         logInfo(lastAIMessageKey, `监听 AI 回复已启动（周期 ${SILENT_WAIT}ms）`);

@@ -25,9 +25,9 @@ WS_PORT = int(os.getenv("AGENT_WS_PORT", 8765))
 LLAMA_HOST = os.getenv("AGENT_LLAMA_HOST", "http://127.0.0.1:9931")
 LLAMA_API_KEY = os.getenv("AGENT_LLAMA_API_KEY", "sk-no-key-required")
 LLAMA_MODEL = os.getenv("AGENT_LLAMA_MODEL", "local-model")
-LLAMA_TIMEOUT = int(os.getenv("AGENT_LLAMA_TIMEOUT", 120))
+LLAMA_TIMEOUT = int(os.getenv("AGENT_LLAMA_TIMEOUT", 600))
 
-AGENT_MAX_TURNS = int(os.getenv("AGENT_MAX_TURNS", 15))
+AGENT_MAX_TURNS = int(os.getenv("AGENT_MAX_TURNS", 20))
 
 # ---------- 工作目录 ----------
 AGENT_DIR = Path(__file__).parent
