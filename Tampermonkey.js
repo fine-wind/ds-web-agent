@@ -92,7 +92,10 @@
     }
 
 
-    function sendMessage(text) {
+    function sendMessageToWeb(text) {
+        if ((text || '').length < 1) {
+            return;
+        }
         logInfo('📤 发送消息:', text.slice(0, 20) + '...');
         const ta = document.querySelector('textarea[placeholder*="发送消息"]');
         if (!ta) {
@@ -234,7 +237,7 @@
 
             try {
                 ws.send(JSON.stringify(message));
-                logInfo(`🚀 WebSocket发送: ${JSON.stringify(payload).slice(0, 20)}`);
+                logInfo(`🚀 WebSocket 发送: ${JSON.stringify(payload).slice(0, 20)}`);
             } catch (e) {
                 clearTimeout(timeout);
                 pendingRequests.delete(id);
@@ -362,7 +365,7 @@
                             dataStr = String(data);
                         }
                         msg = dataStr;
-                        sendMessage(msg);
+                        sendMessageToWeb(msg);
                     } else {
                         msg = `执行结果：操作失败，${result.message || '未知错误'}`;
                         // 出错时允许重新处理同一 AI 消息
@@ -385,7 +388,7 @@
         let pathname = location.pathname;
         let key = 'agent_prompt_sent' + pathname;
         if (pathname.length < 10) {
-            sendMessage(prompt);
+            sendMessageToWeb(prompt);
             logInfo('系统提示词已发送');
             setTimeout(() => {
                 localStorage.setItem('agent_prompt_sent' + location.pathname, 'true');
@@ -507,7 +510,7 @@
     }
 
     top.window.getLatestAIMessage = getLatestAIMessage;
-    top.window.sendMessage = sendMessage;
+    top.window.sendMessage = sendMessageToWeb;
 
     init();
 })();

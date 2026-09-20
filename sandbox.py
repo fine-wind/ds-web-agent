@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import sys
 import threading
+import platform
 import time
 from datetime import datetime
 from pathlib import Path
@@ -30,8 +31,8 @@ class SandboxConfig:
             allow_shell: bool = True,
             allow_python: bool = True,
             allow_network: bool = True,
-            max_file_bytes: int = 5 * 1024 * 1024,      # 单文件最大 5MB
-            max_output_chars: int = 20000,              # 输出截断
+            max_file_bytes: int = 5 * 1024 * 1024,  # 单文件最大 5MB
+            max_output_chars: int = 20000,  # 输出截断
             default_timeout: int = 30,
             max_timeout: int = 120,
             shell_whitelist=None,
@@ -152,11 +153,7 @@ def read_file(path: str, encoding: str = "utf-8"):
 
     content = p.read_text(encoding=encoding)
     _audit("read_file", {"path": path}, True)
-    return {
-        "path": str(p.relative_to(CFG.root)),
-        "size": size,
-        "content": _clip(content),
-    }
+    return f"{p.relative_to(CFG.root)}\n----------\n大小：{size}\n----------\n{content}"
 
 
 def write_file(path: str, content: str, encoding: str = "utf-8", append: bool = False):
@@ -191,11 +188,8 @@ def list_directory(path: str = ".", recursive: bool = False):
     for child in iterator:
         try:
             stat = child.stat()
-            items.append({
-                "name": str(child.relative_to(p)) if recursive else child.name,
-                "is_dir": child.is_dir(),
-                "size": stat.st_size if child.is_file() else None,
-            })
+            items.append(
+                f"名称：{str(child.relative_to(p)) if recursive else child.name}，是否文件夹：{child.is_dir()}，大小：{stat.st_size if child.is_file() else None}")
         except OSError:
             continue
         if len(items) >= 500:
@@ -295,9 +289,9 @@ def grep(pattern: str, path: str = ".", file_glob: str = "*", max_results: int =
 # Shell 沙箱
 # =========================================================
 _SHELL_BLOCK_PATTERNS = [
-    r"\.\.\\", r"\.\./",          # 目录穿越
-    r"[&|;`$]\s*\(",             # 子 shell / 命令替换
-    r"\brm\s+-rf\s+/",           # 危险 rm
+    r"\.\.\\", r"\.\./",  # 目录穿越
+    r"[&|;`$]\s*\(",  # 子 shell / 命令替换
+    r"\brm\s+-rf\s+/",  # 危险 rm
     r"\bdel\s+/s\s+/q\s+[a-zA-Z]:",  # 危险 del
     r"\bformat\b",
     r"\bshutdown\b", r"\breboot\b",
@@ -398,7 +392,7 @@ def python_exec(code: str, timeout: int = None):
 
     try:
         proc = subprocess.run(
-            [sys.executable, "-I", "-c", full_code],   # -I 隔离模式
+            [sys.executable, "-I", "-c", full_code],  # -I 隔离模式
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -496,6 +490,65 @@ _BIN_OPS = {
     "Pow": lambda a, b: a ** b,
 }
 _UNARY_OPS = {"UAdd": lambda a: +a, "USub": lambda a: -a}
+
+
+def git_info():
+    """
+    返回沙箱运行环境的基本系统信息，以及沙箱根目录的 Git 状态（如果适用）。
+    """
+    info = {
+        "os_system": platform.system(),
+        "os_release": platform.release(),
+        "architecture": platform.machine(),
+        "python_version": sys.version.split()[0],
+        "sandbox_root": str(CFG.root),
+        "read_only_mode": CFG.read_only,
+    }
+
+    # 尝试安全地获取沙箱根目录的 Git 信息
+    if CFG.allow_shell:
+        try:
+            # 1. 检查是否是 git 仓库
+            rev_parse = subprocess.run(
+                ["git", "rev-parse", "--is-inside-work-tree"],
+                cwd=str(CFG.root),
+                capture_output=True,
+                text=True,
+                timeout=3
+            )
+            if rev_parse.returncode == 0 and rev_parse.stdout.strip() == "true":
+                info["is_git_repo"] = True
+
+                # 2. 获取当前分支
+                branch = subprocess.run(
+                    ["git", "branch", "--show-current"],
+                    cwd=str(CFG.root),
+                    capture_output=True,
+                    text=True,
+                    timeout=3
+                )
+                if branch.returncode == 0:
+                    info["git_branch"] = branch.stdout.strip() or "detached HEAD"
+
+                # 3. 获取最新 commit 短哈希
+                commit = subprocess.run(
+                    ["git", "rev-parse", "--short", "HEAD"],
+                    cwd=str(CFG.root),
+                    capture_output=True,
+                    text=True,
+                    timeout=3
+                )
+                if commit.returncode == 0:
+                    info["git_commit"] = commit.stdout.strip()
+            else:
+                info["is_git_repo"] = False
+        except Exception:
+            info["git_status"] = "check_failed_or_git_not_installed"
+    else:
+        info["git_status"] = "shell_execution_disabled_in_sandbox"
+
+    _audit("git_info", {}, True)
+    return info
 
 
 def _eval_node(node):
@@ -787,8 +840,19 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_info",
+            "description": "获取沙箱运行环境的基本系统信息（OS、Python版本等），以及沙箱根目录的 Git 仓库状态（分支、Commit等）。",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
 ]
-
 
 TOOL_FUNCTIONS = {
     "read_file": read_file,
@@ -805,6 +869,7 @@ TOOL_FUNCTIONS = {
     "get_current_time": get_current_time,
     "memory_save": memory_save,
     "memory_recall": memory_recall,
+    "git_info": git_info,
 }
 
 
@@ -813,15 +878,20 @@ def execute_tool(name: str, arguments):
         try:
             arguments = json.loads(arguments)
         except json.JSONDecodeError as e:
-            return {"error": f"参数不是合法 JSON: {e}"}
+            return f"参数不是合法 JSON: {e}"
 
     fn = TOOL_FUNCTIONS.get(name)
     if not fn:
-        return {"error": f"未知工具: {name}"}
+        return f"未知工具: {name}"
 
     try:
-        return fn(**(arguments or {}))
+        result = fn(**(arguments or {}))
     except SandboxError as e:
-        return {"error": f"沙箱拒绝: {e}"}
+        result = {"error": f"沙箱拒绝: {e}"}
     except Exception as e:
-        return {"error": f"{type(e).__name__}: {e}"}
+        result = {"error": f"{type(e).__name__}: {e}"}
+
+    # 统一出口：字符串直接返回，其他转 JSON 文本
+    if isinstance(result, str):
+        return result
+    return json.dumps(result, ensure_ascii=False)

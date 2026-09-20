@@ -219,12 +219,6 @@ async def handle_client_message(data, request_id):
         # 客户端有时会在 AI 还没渲染出文本时发空内容，直接跳过
         return make_response("skipped", message="content 为空，已跳过")
 
-    # 非操作类：以 🤖 开头且不含代码块 → 跳过，避免死循环
-    stripped = content.lstrip()
-    if stripped.startswith("🤖") and "```" not in content:
-        logger.info("AI 回复以 🤖 开头且无代码块，判定为非操作类，跳过")
-        return make_response("skipped", message="非操作类回复，已跳过")
-
     # ---- 组装 messages 并跑 Agent ----
     try:
         system_prompt = load_local_system_prompt()
@@ -244,7 +238,8 @@ async def handle_client_message(data, request_id):
 
         if outcome["type"] == "text":
             # 模型没调工具，直接返回文本
-            return make_response("success", data=outcome["content"])
+            # return make_response("success", data=outcome["content"])
+            return make_response("success", data="")
 
         # 模型调了工具，返回工具执行结果
         return make_response("success", data=outcome["tool_calls"])

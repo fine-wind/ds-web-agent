@@ -21,8 +21,6 @@
                                               ↓
                                     py 执行工具 → 结果塞回本地 LLM
                                               ↓
-                                    本地 LLM 最终自然语言回复
-                                              ↓
                                     py 通过 WebSocket 返回给 JS
                                               ↓
                                     JS 把结果发回网页 AI
