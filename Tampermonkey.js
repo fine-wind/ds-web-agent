@@ -78,6 +78,7 @@
 
     // ============ 通过虚拟列表 key 获取最新 AI 消息 ============
     function getLatestAIMessage() {
+        document.querySelectorAll('.code-info-button-text').forEach(el => {el.textContent = '';});
         let items = document.querySelectorAll('[data-virtual-list-item-key]');
         if (!items.length) return null;
 
