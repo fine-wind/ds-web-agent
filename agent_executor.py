@@ -206,7 +206,7 @@ def run_agent_once(chat_completion_fn, messages):
 
     return {
         "type": "tools",
-        "tool_calls": results,
+        "content": "\n\n".join(str(r) for r in results),
     }
 
 
@@ -263,7 +263,7 @@ async def handle_client_message(data, request_id):
             return make_response("success", data="")
 
         # 模型调了工具，返回工具执行结果
-        return make_response("success", data=outcome["tool_calls"])
+        return make_response("success", data=outcome["content"])
 
     except Exception as e:
         logger.error(f"Agent 执行异常: {e}", exc_info=True)

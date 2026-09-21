@@ -359,6 +359,8 @@
                         let dataStr;
                         if (data === null || data === undefined) {
                             dataStr = '无返回数据';
+                        } else if (Array.isArray(data)) {
+                            dataStr = data.map(item => typeof item === 'string' ? item : JSON.stringify(item, null, 2)).join('\n\n');
                         } else if (typeof data === 'object') {
                             dataStr = JSON.stringify(data, null, 2);
                         } else {
