@@ -10,6 +10,7 @@ import requests
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
 import threading
+import time
 from sandbox import TOOLS, execute_tool, SandboxConfig, CFG
 
 try:
@@ -19,7 +20,7 @@ except ImportError:
 
 # ---------- 配置（支持环境变量） ----------
 WORK_DIR_ENV = os.getenv("AGENT_WORK_DIR", None)
-WS_HOST = os.getenv("AGENT_WS_HOST", "0.0.0.0")
+WS_HOST = os.getenv("AGENT_WS_HOST", "127.0.0.1")
 WS_PORT = int(os.getenv("AGENT_WS_PORT", 8765))
 
 LLAMA_HOST = os.getenv("AGENT_LLAMA_HOST", "http://127.0.0.1:9931")
@@ -113,17 +114,37 @@ def chat_completion(messages,
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
 
-    r = requests.post(
-        f"{host}/v1/chat/completions",
-        json=payload,
-        headers=headers,
-        timeout=timeout,
-    )
-    if r.status_code >= 400:
-        body = r.text[:2000]
-        logger.error(f"LLM 返回 {r.status_code}: {body}")
-        print(f"\n❌ LLM 返回 {r.status_code}:\n{body}\n")
-        raise RuntimeError(f"LLM {r.status_code}: {body[:500]}")
+    url = f"{host}/v1/chat/completions"
+    max_attempts = 3
+    r = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            r = requests.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=timeout,
+            )
+        except (requests.ConnectionError, requests.Timeout) as e:
+            logger.warning(f"LLM request failed (attempt {attempt}/{max_attempts}): {e}")
+            if attempt < max_attempts:
+                time.sleep(2 ** (attempt - 1))
+                continue
+            raise RuntimeError(f"LLM connection failed after {max_attempts} attempts: {e}")
+
+        if r.status_code >= 500:
+            logger.warning(f"LLM returned {r.status_code} (attempt {attempt}/{max_attempts})")
+            if attempt < max_attempts:
+                time.sleep(2 ** (attempt - 1))
+                continue
+            raise RuntimeError(f"LLM {r.status_code}: {r.text[:500]}")
+
+        if r.status_code >= 400:
+            body = r.text[:2000]
+            logger.error(f"LLM returned {r.status_code}: {body}")
+            raise RuntimeError(f"LLM {r.status_code}: {body[:500]}")
+
+        break
 
     if stream:
         return r

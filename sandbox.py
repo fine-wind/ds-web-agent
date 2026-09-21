@@ -189,14 +189,14 @@ def list_directory(path: str = ".", recursive: bool = False):
         try:
             stat = child.stat()
             items.append(
-                f"名称：{str(child.relative_to(p)) if recursive else child.name}，是否文件夹：{child.is_dir()}，大小：{stat.st_size if child.is_file() else None}")
+                f"名称：{str(child.relative_to(p)) if recursive else child.name}，是否文件夹：{child.is_dir()}，大小：{stat.st_size if child.is_file() else None}\n")
         except OSError:
             continue
         if len(items) >= 500:
             break
 
     _audit("list_directory", {"path": path, "recursive": recursive}, True)
-    return {"path": str(p.relative_to(CFG.root)), "count": len(items), "items": items}
+    return f"路径：{ str(p.relative_to(CFG.root))}，数量：{len(items)}\n{items}"
 
 
 def delete_file(path: str):
@@ -366,11 +366,7 @@ def execute_shell(command: str, cwd: str = None, timeout: int = None):
         ok = proc.returncode == 0
         _audit("execute_shell", {"command": command, "cwd": cwd}, ok,
                f"exit={proc.returncode}")
-        return {
-            "exit_code": proc.returncode,
-            "stdout": _clip(proc.stdout),
-            "stderr": _clip(proc.stderr),
-        }
+        return f"exit_code:{proc.returncode}, stdout:{_clip(proc.stdout)}, stderr:{_clip(proc.stderr)}\n"
     except subprocess.TimeoutExpired:
         _audit("execute_shell", {"command": command}, False, "timeout")
         raise SandboxError(f"命令超时 (>{timeout}s)")
@@ -402,11 +398,8 @@ def python_exec(code: str, timeout: int = None):
         ok = proc.returncode == 0
         _audit("python_exec", {"code_len": len(code)}, ok,
                f"exit={proc.returncode}")
-        return {
-            "exit_code": proc.returncode,
-            "stdout": _clip(proc.stdout),
-            "stderr": _clip(proc.stderr),
-        }
+        return f"exit_code:{proc.returncode}, stdout:{_clip(proc.stdout)}, stderr:{_clip(proc.stderr)}\n"
+
     except subprocess.TimeoutExpired:
         _audit("python_exec", {"code_len": len(code)}, False, "timeout")
         raise SandboxError(f"Python 执行超时 (>{timeout}s)")
@@ -593,10 +586,10 @@ def get_current_time(timezone: str = "Asia/Shanghai"):
 
 
 # =========================================================
-# 记忆（也限制在沙箱内）
+# 记忆
 # =========================================================
 def _memory_file() -> Path:
-    return safe_path("agent_memory.json")
+    return Path("agent_memory.json")
 
 
 def memory_save(key: str, value: str):

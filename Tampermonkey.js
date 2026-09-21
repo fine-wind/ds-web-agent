@@ -336,7 +336,6 @@
 
             lastOver = true;
             processing = true;
-            iteration++;
 
             logInfo(lastAIMessageKey + 'AI 回复内容预览:', `(长度: ${finalText.length})`, `${lastProcessedText.slice(0, 20)}...${lastProcessedText.slice(-20)}`);
 
@@ -398,7 +397,6 @@
 
     function startAgent(skipPrompt) {
         logInfo('启动 Agent');
-        iteration = 0;
         processing = false;
 
         if (!wsConnected) connectWebSocket();
