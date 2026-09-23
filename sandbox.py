@@ -85,7 +85,22 @@ def _audit(tool: str, args: dict, ok: bool, extra: str = ""):
     }
     try:
         with CFG._lock:
-            with CFG.audit_log.open("a", encoding="utf-8") as f:
+            log_path = CFG.audit_log
+            try:
+                if log_path.exists() and log_path.stat().st_size > 10 * 1024 * 1024:
+                    backup = log_path.with_suffix(log_path.suffix + ".1")
+                    if backup.exists():
+                        try:
+                            backup.unlink()
+                        except OSError:
+                            pass
+                    try:
+                        log_path.rename(backup)
+                    except OSError:
+                        pass
+            except OSError:
+                pass
+            with log_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except OSError:
         pass
@@ -153,7 +168,7 @@ def read_file(path: str, encoding: str = "utf-8"):
 
     content = p.read_text(encoding=encoding)
     _audit("read_file", {"path": path}, True)
-    return f"{p.relative_to(CFG.root)}\n----------\n大小：{size}\n----------\n{content}"
+    return f"文件：{p.relative_to(CFG.root)}\n----------\n大小：{size}\n----------\n{content}"
 
 
 def write_file(path: str, content: str, encoding: str = "utf-8", append: bool = False):
@@ -189,14 +204,15 @@ def list_directory(path: str = ".", recursive: bool = False):
         try:
             stat = child.stat()
             items.append(
-                f"名称：{str(child.relative_to(p)) if recursive else child.name}，是否文件夹：{child.is_dir()}，大小：{stat.st_size if child.is_file() else None}\n")
+                f"名称：{str(child.relative_to(p)) if recursive else child.name}，是否文件夹：{child.is_dir()}，大小：{stat.st_size if child.is_file() else None}")
         except OSError:
             continue
         if len(items) >= 500:
             break
 
     _audit("list_directory", {"path": path, "recursive": recursive}, True)
-    return f"路径：{ str(p.relative_to(CFG.root))}，数量：{len(items)}\n{items}"
+    tail = "\n".join(items)
+    return f"路径：{str(p.relative_to(CFG.root))}，数量：{len(items)}\n" + tail
 
 
 def delete_file(path: str):
@@ -252,9 +268,20 @@ def search_files(pattern: str = "*", path: str = ".", max_results: int = 50):
     return {"pattern": pattern, "count": len(results), "files": results}
 
 
+def _compile_safe_regex(pattern: str):
+    if len(pattern) > 200:
+        raise SandboxError("正则表达式过长（>200 字符）")
+    if re.search(r"(\([^)]*[+*][^)]*\))[+*{]", pattern):
+        raise SandboxError("疑似灾难性回溯的正则")
+    try:
+        return re.compile(pattern)
+    except re.error as e:
+        raise SandboxError(f"正则表达式无效: {e}")
+
+
 def grep(pattern: str, path: str = ".", file_glob: str = "*", max_results: int = 50):
     root = safe_path(path, must_exist=True)
-    regex = re.compile(pattern)
+    regex = _compile_safe_regex(pattern)
     matches = []
 
     for p in root.rglob("*"):
@@ -297,7 +324,16 @@ _SHELL_BLOCK_PATTERNS = [
     r"\bshutdown\b", r"\breboot\b",
     r"\bcurl\b.*\|\s*\b(sh|bash|powershell)\b",  # 管道下载执行
     r"\bwget\b.*\|\s*\b(sh|bash|powershell)\b",
+    r"\bpowershell\b.*\-(enc|encodedcommand)\b",
+    r"\bcmd\b\s*/(c|k)\b.*[&|;]",
 ]
+
+
+def _has_shell_meta(command: str) -> bool:
+    """检查命令在引号外是否含 shell 元字符（连接符/重定向/替换）。"""
+    stripped = re.sub(r"'[^']*'", "", command)
+    stripped = re.sub(r'"[^"]*"', "", stripped)
+    return bool(re.search(r"[&|;\x60$<>]", stripped))
 
 
 def _sanitized_env():
@@ -336,9 +372,12 @@ def _check_shell_command(command: str):
     if head.endswith(".exe"):
         head = head[:-4]
 
+    if _has_shell_meta(command):
+        raise SandboxError("命令包含 shell 元字符，拒绝执行")
+
     if CFG.shell_whitelist:
-        if not any(head == w.lower() or head.startswith(w.lower())
-                   for w in CFG.shell_whitelist):
+        allowed = [w.lower() for w in CFG.shell_whitelist]
+        if head not in allowed:
             raise SandboxError(
                 f"命令 '{head}' 不在白名单内。允许: {CFG.shell_whitelist}"
             )
@@ -379,10 +418,11 @@ def python_exec(code: str, timeout: int = None):
     timeout = min(timeout or CFG.default_timeout, CFG.max_timeout)
 
     # 前置一段注入代码，把工作目录锁定到沙箱根
+    root_literal = repr(str(CFG.root))
     preamble = (
         "import os\n"
-        f"os.chdir(r'{CFG.root}')\n"
-        f"os.environ['SANDBOX_ROOT'] = r'{CFG.root}'\n"
+        f"os.chdir({root_literal})\n"
+        f"os.environ['SANDBOX_ROOT'] = {root_literal}\n"
     )
     full_code = preamble + code
 
@@ -412,11 +452,16 @@ def _check_host(url: str):
     if not CFG.allow_network:
         raise SandboxError("沙箱未开启网络访问")
 
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        raise SandboxError(f"只允许 http/https，当前 scheme: {scheme or '空'}")
+
     if CFG.allowed_hosts is None:
         return
 
-    from urllib.parse import urlparse
-    host = urlparse(url).hostname or ""
+    host = parsed.hostname or ""
     if not any(host == h or host.endswith("." + h) for h in CFG.allowed_hosts):
         raise SandboxError(f"目标主机 {host} 不在白名单内")
 
@@ -473,6 +518,15 @@ def http_request(
 # =========================================================
 # 无副作用工具
 # =========================================================
+def _safe_pow(a, b):
+    if isinstance(b, (int, float)) and abs(b) > 1000:
+        raise SandboxError("指数过大")
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        if abs(a) > 1 and b > 100:
+            raise SandboxError("幂运算结果可能过大")
+    return a ** b
+
+
 _BIN_OPS = {
     "Add": lambda a, b: a + b,
     "Sub": lambda a, b: a - b,
@@ -480,7 +534,7 @@ _BIN_OPS = {
     "Div": lambda a, b: a / b,
     "FloorDiv": lambda a, b: a // b,
     "Mod": lambda a, b: a % b,
-    "Pow": lambda a, b: a ** b,
+    "Pow": _safe_pow,
 }
 _UNARY_OPS = {"UAdd": lambda a: +a, "USub": lambda a: -a}
 

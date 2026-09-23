@@ -93,7 +93,7 @@ def chat_completion(messages,
                     api_key=None,
                     model=None,
                     temperature=0.7,
-                    stream=False,          # ← 新增
+                    stream=False,  # ← 新增
                     timeout=None):
     host = host or LLAMA_HOST
     api_key = api_key or LLAMA_API_KEY
@@ -150,6 +150,7 @@ def chat_completion(messages,
         return r
     return r.json()
 
+
 # ---------- Agent 循环 ----------
 def run_agent_once(chat_completion_fn, messages):
     """
@@ -170,6 +171,9 @@ def run_agent_once(chat_completion_fn, messages):
     except (KeyError, IndexError) as e:
         logger.error(f"模型响应结构异常: {e}, resp={resp}")
         raise RuntimeError(f"模型响应结构异常: {e}")
+
+    content_ = resp["choices"][0]["message"]["content"]
+    logger.info(f"🤖 : {content_}")
 
     tool_calls = msg.get("tool_calls") or []
 
@@ -202,11 +206,11 @@ def run_agent_once(chat_completion_fn, messages):
 
         results.append(result)
 
-    logger.info(f"工具全部执行完毕，共 {len(results)} 个，直接返回结果")
+    logger.info(f"工具全部执行完毕，共 {len(results)} 个")
 
     return {
         "type": "tools",
-        "content": "\n\n".join(str(r) for r in results),
+        "content": content_ + "\n".join(str(r) for r in results),
     }
 
 
@@ -253,17 +257,19 @@ async def handle_client_message(data, request_id):
     ]
 
     logger.info(f"开始 Agent 循环，用户消息 {len(content)} 字符")
-
+    logger.info(f"😊 : {messages[1]["content"]}")
     try:
         outcome = await asyncio.to_thread(run_agent_once, chat_completion, messages)
 
         if outcome["type"] == "text":
             # 模型没调工具，直接返回文本
-            # return make_response("success", data=outcome["content"])
-            return make_response("success", data="")
+            content_ = outcome["content"]
+            if "呵呵,不关我事" in content_:
+                return make_response("success", data="")
+            return make_response("success", data="小牛：" + content_)
 
         # 模型调了工具，返回工具执行结果
-        return make_response("success", data=outcome["content"])
+        return make_response("success", data="小牛：" + outcome["content"])
 
     except Exception as e:
         logger.error(f"Agent 执行异常: {e}", exc_info=True)
@@ -342,9 +348,11 @@ if __name__ == '__main__':
     print(f"🧰 沙箱允许的主机: {CFG.allowed_hosts}")
     print(f"🧰 沙箱 shell 白名单: {CFG.shell_whitelist}")
 
+
     async def start_ws():
         async with websockets.serve(websocket_handler, WS_HOST, WS_PORT):
             await asyncio.Future()  # 永久运行
+
 
     try:
         asyncio.run(start_ws())
