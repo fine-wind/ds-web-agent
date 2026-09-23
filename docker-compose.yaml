@@ -7,10 +7,11 @@ services:
       - "8765:8765"
     volumes:
       - ./:/app
+      - ./:/work
     environment:
       AGENT_WS_HOST: 0.0.0.0
       AGENT_WS_PORT: "8765"
-      AGENT_WORK_DIR: /app/agent_workspace
+      AGENT_WORK_DIR: /work
       PYTHONUNBUFFERED: "1"
       AGENT_LLAMA_HOST: "http://192.168.1.46:9931"
     command: >

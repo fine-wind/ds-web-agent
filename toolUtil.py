@@ -3,12 +3,9 @@ import fnmatch
 import json
 import os
 import re
-import shlex
 import subprocess
 import sys
 import threading
-import platform
-import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlencode
@@ -21,7 +18,7 @@ except ImportError:
 
 
 # =========================================================
-# 沙箱配置
+# 配置（已去掉沙箱约束）
 # =========================================================
 class SandboxConfig:
     def __init__(
@@ -31,8 +28,8 @@ class SandboxConfig:
             allow_shell: bool = True,
             allow_python: bool = True,
             allow_network: bool = True,
-            max_file_bytes: int = 5 * 1024 * 1024,  # 单文件最大 5MB
-            max_output_chars: int = 20000,  # 输出截断
+            max_file_bytes: int = 5 * 1024 * 1024,   # 单文件最大 5MB
+            max_output_chars: int = 20000,            # 输出截断
             default_timeout: int = 30,
             max_timeout: int = 120,
             shell_whitelist=None,
@@ -40,7 +37,10 @@ class SandboxConfig:
             audit_log: str = None,
     ):
         self.root = Path(root).resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
 
         self.read_only = read_only
         self.allow_shell = allow_shell
@@ -51,10 +51,9 @@ class SandboxConfig:
         self.default_timeout = default_timeout
         self.max_timeout = max_timeout
 
-        # 默认 shell 白名单：只允许这些命令前缀
+        # 空列表 = 不做白名单检查
         self.shell_whitelist = shell_whitelist or []
-
-        # 网络白名单：None 表示全部放行
+        # None = 全部放行
         self.allowed_hosts = allowed_hosts
 
         self.audit_log = Path(audit_log) if audit_log else (self.root / "audit.log")
@@ -103,20 +102,37 @@ def _audit(tool: str, args: dict, ok: bool, extra: str = ""):
 
 
 # =========================================================
-# 路径沙箱
+# 路径解析（不再限制在 root 内）
 # =========================================================
 def safe_path(user_path: str, must_exist: bool = False) -> Path:
     if user_path is None:
         user_path = "."
+
     p = Path(user_path)
-    if must_exist and not p.exists():
+
+    # 相对路径 -> 相对 CFG.root；绝对路径 -> 原样使用
+    if not p.is_absolute():
+        candidate = (CFG.root / p)
+    else:
+        candidate = p
+
+    try:
+        resolved = candidate.resolve(strict=False)
+    except OSError as e:
+        raise SandboxError(f"路径解析失败: {e}") from e
+
+    if must_exist and not resolved.exists():
         raise SandboxError(f"路径不存在: {user_path}")
-    return p.resolve(strict=False)
+
+    return resolved
 
 
-def _check_write_allowed():
-    if CFG.read_only:
-        raise SandboxError("当前沙箱为只读模式，禁止写操作")
+def _rel(p: Path) -> str:
+    """尽量返回相对 CFG.root 的路径；在 root 之外时返回绝对路径。"""
+    try:
+        return str(p.relative_to(CFG.root))
+    except ValueError:
+        return str(p)
 
 
 def _clip(text: str) -> str:
@@ -140,11 +156,10 @@ def read_file(path: str, encoding: str = "utf-8"):
 
     content = p.read_text(encoding=encoding)
     _audit("read_file", {"path": path}, True)
-    return f"文件：{p.relative_to(CFG.root)}\n----------\n大小：{size}\n----------\n{content}"
+    return f"文件：{_rel(p)}\n----------\n大小：{size}\n----------\n{content}"
 
 
 def write_file(path: str, content: str, encoding: str = "utf-8", append: bool = False):
-    _check_write_allowed()
     p = safe_path(path)
 
     data = content.encode(encoding)
@@ -158,7 +173,7 @@ def write_file(path: str, content: str, encoding: str = "utf-8", append: bool = 
 
     _audit("write_file", {"path": path, "append": append, "bytes": len(data)}, True)
     return {
-        "path": str(p.relative_to(CFG.root)),
+        "path": _rel(p),
         "bytes": len(data),
         "append": append,
     }
@@ -176,7 +191,10 @@ def list_directory(path: str = ".", recursive: bool = False):
         try:
             stat = child.stat()
             items.append(
-                f"名称：{str(child.relative_to(p)) if recursive else child.name}，是否文件夹：{child.is_dir()}，大小：{stat.st_size if child.is_file() else None}")
+                f"名称：{str(child.relative_to(p)) if recursive else child.name}，"
+                f"是否文件夹：{child.is_dir()}，"
+                f"大小：{stat.st_size if child.is_file() else None}"
+            )
         except OSError:
             continue
         if len(items) >= 500:
@@ -184,27 +202,23 @@ def list_directory(path: str = ".", recursive: bool = False):
 
     _audit("list_directory", {"path": path, "recursive": recursive}, True)
     tail = "\n".join(items)
-    return f"路径：{str(p.relative_to(CFG.root))}，数量：{len(items)}\n" + tail
+    return f"路径：{_rel(p)}，数量：{len(items)}\n" + tail
 
 
 def delete_file(path: str):
-    _check_write_allowed()
     p = safe_path(path, must_exist=True)
     if p.is_dir():
         raise SandboxError("delete_file 只支持文件，目录请用 delete_directory")
 
     p.unlink()
     _audit("delete_file", {"path": path}, True)
-    return {"deleted": str(p.relative_to(CFG.root))}
+    return {"deleted": _rel(p)}
 
 
 def delete_directory(path: str, recursive: bool = False):
-    _check_write_allowed()
     p = safe_path(path, must_exist=True)
     if not p.is_dir():
         raise SandboxError(f"不是目录: {path}")
-    if p == CFG.root:
-        raise SandboxError("禁止删除沙箱根目录")
 
     if recursive:
         for child in sorted(p.rglob("*"), reverse=True):
@@ -220,19 +234,14 @@ def delete_directory(path: str, recursive: bool = False):
         p.rmdir()
 
     _audit("delete_directory", {"path": path, "recursive": recursive}, True)
-    return {"deleted": str(p.relative_to(CFG.root)), "recursive": recursive}
+    return {"deleted": _rel(p), "recursive": recursive}
 
 
 def search_files(pattern: str = "*", path: str = ".", max_results: int = 50):
     root = safe_path(path, must_exist=True)
     results = []
     for p in root.rglob(pattern):
-        # 每个结果也要验证一遍，防止符号链接逃逸
-        try:
-            safe_path(str(p))
-        except SandboxError:
-            continue
-        results.append(str(p.relative_to(CFG.root)))
+        results.append(_rel(p))
         if len(results) >= max_results:
             break
 
@@ -241,10 +250,8 @@ def search_files(pattern: str = "*", path: str = ".", max_results: int = 50):
 
 
 def _compile_safe_regex(pattern: str):
-    if len(pattern) > 200:
-        raise SandboxError("正则表达式过长（>200 字符）")
-    if re.search(r"(\([^)]*[+*][^)]*\))[+*{]", pattern):
-        raise SandboxError("疑似灾难性回溯的正则")
+    if len(pattern) > 2000:
+        raise SandboxError("正则表达式过长（>2000 字符）")
     try:
         return re.compile(pattern)
     except re.error as e:
@@ -259,10 +266,6 @@ def grep(pattern: str, path: str = ".", file_glob: str = "*", max_results: int =
     for p in root.rglob("*"):
         if not p.is_file() or not fnmatch.fnmatch(p.name, file_glob):
             continue
-        try:
-            safe_path(str(p))
-        except SandboxError:
-            continue
 
         try:
             text = p.read_text(encoding="utf-8", errors="replace")
@@ -272,7 +275,7 @@ def grep(pattern: str, path: str = ".", file_glob: str = "*", max_results: int =
         for lineno, line in enumerate(text.splitlines(), 1):
             if regex.search(line):
                 matches.append({
-                    "file": str(p.relative_to(CFG.root)),
+                    "file": _rel(p),
                     "line": lineno,
                     "text": _clip(line),
                 })
@@ -285,78 +288,11 @@ def grep(pattern: str, path: str = ".", file_glob: str = "*", max_results: int =
 
 
 # =========================================================
-# Shell 沙箱
+# Shell 执行（无白名单、无黑名单、无环境裁剪）
 # =========================================================
-_SHELL_BLOCK_PATTERNS = [
-    r"\.\.\\", r"\.\./",  # 目录穿越
-    r"[&|;`$]\s*\(",  # 子 shell / 命令替换
-    r"\brm\s+-rf\s+/",  # 危险 rm
-    r"\bdel\s+/s\s+/q\s+[a-zA-Z]:",  # 危险 del
-    r"\bformat\b",
-    r"\bshutdown\b", r"\breboot\b",
-    r"\bcurl\b.*\|\s*\b(sh|bash|powershell)\b",  # 管道下载执行
-    r"\bwget\b.*\|\s*\b(sh|bash|powershell)\b",
-    r"\bpowershell\b.*\-(enc|encodedcommand)\b",
-    r"\bcmd\b\s*/(c|k)\b.*[&|;]",
-]
-
-
-def _has_shell_meta(command: str) -> bool:
-    """检查命令在引号外是否含 shell 元字符（连接符/重定向/替换）。"""
-    stripped = re.sub(r"'[^']*'", "", command)
-    stripped = re.sub(r'"[^"]*"', "", stripped)
-    return bool(re.search(r"[&|;\x60$<>]", stripped))
-
-
-def _sanitized_env():
-    """只保留最基础的环境变量，剥离敏感信息。"""
-    keep = {"PATH", "SYSTEMROOT", "SystemRoot", "TEMP", "TMP",
-            "PATHEXT", "COMSPEC", "HOME", "USERPROFILE", "LANG", "LC_ALL"}
-    env = {k: v for k, v in os.environ.items() if k in keep}
-
-    # 兜底：剔除任何包含敏感关键字的变量
-    for k in list(env.keys()):
-        if re.search(r"(TOKEN|KEY|SECRET|PASS|CREDENTIAL)", k, re.I):
-            env.pop(k, None)
-
-    env["SANDBOX_ROOT"] = str(CFG.root)
-    return env
-
-
-def _check_shell_command(command: str):
-    if not CFG.allow_shell:
-        raise SandboxError("沙箱未开启 shell 执行")
-
-    for pat in _SHELL_BLOCK_PATTERNS:
-        if re.search(pat, command, re.I):
-            raise SandboxError(f"命令命中黑名单规则: {pat}")
-
-    # 解析首个 token，检查白名单
-    try:
-        parts = shlex.split(command, posix=False)
-    except ValueError:
-        parts = command.split()
-
-    if not parts:
-        raise SandboxError("空命令")
-
-    head = Path(parts[0]).name.lower()
-    if head.endswith(".exe"):
-        head = head[:-4]
-
-    if _has_shell_meta(command):
-        raise SandboxError("命令包含 shell 元字符，拒绝执行")
-
-    if CFG.shell_whitelist:
-        allowed = [w.lower() for w in CFG.shell_whitelist]
-        if head not in allowed:
-            raise SandboxError(
-                f"命令 '{head}' 不在白名单内。允许: {CFG.shell_whitelist}"
-            )
-
-
 def execute_shell(command: str, cwd: str = None, timeout: int = None):
-    _check_shell_command(command)
+    if not CFG.allow_shell:
+        raise SandboxError("shell 执行已被禁用")
 
     workdir = safe_path(cwd or ".")
     if not workdir.is_dir():
@@ -372,12 +308,14 @@ def execute_shell(command: str, cwd: str = None, timeout: int = None):
             capture_output=True,
             text=True,
             timeout=timeout,
-            env=_sanitized_env(),
+            env=os.environ.copy(),
         )
         ok = proc.returncode == 0
         _audit("execute_shell", {"command": command, "cwd": cwd}, ok,
                f"exit={proc.returncode}")
-        return f"exit_code:{proc.returncode}, stdout:{_clip(proc.stdout)}, stderr:{_clip(proc.stderr)}\n"
+        return (f"exit_code:{proc.returncode}, "
+                f"stdout:{_clip(proc.stdout)}, "
+                f"stderr:{_clip(proc.stderr)}\n")
     except subprocess.TimeoutExpired:
         _audit("execute_shell", {"command": command}, False, "timeout")
         raise SandboxError(f"命令超时 (>{timeout}s)")
@@ -385,32 +323,25 @@ def execute_shell(command: str, cwd: str = None, timeout: int = None):
 
 def python_exec(code: str, timeout: int = None):
     if not CFG.allow_python:
-        raise SandboxError("沙箱未开启 python 执行")
+        raise SandboxError("python 执行已被禁用")
 
     timeout = min(timeout or CFG.default_timeout, CFG.max_timeout)
 
-    # 前置一段注入代码，把工作目录锁定到沙箱根
-    root_literal = repr(str(CFG.root))
-    preamble = (
-        "import os\n"
-        f"os.chdir({root_literal})\n"
-        f"os.environ['SANDBOX_ROOT'] = {root_literal}\n"
-    )
-    full_code = preamble + code
-
     try:
         proc = subprocess.run(
-            [sys.executable, "-I", "-c", full_code],  # -I 隔离模式
+            [sys.executable, "-c", code],
             capture_output=True,
             text=True,
             timeout=timeout,
             cwd=str(CFG.root),
-            env=_sanitized_env(),
+            env=os.environ.copy(),
         )
         ok = proc.returncode == 0
         _audit("python_exec", {"code_len": len(code)}, ok,
                f"exit={proc.returncode}")
-        return f"exit_code:{proc.returncode}, stdout:{_clip(proc.stdout)}, stderr:{_clip(proc.stderr)}\n"
+        return (f"exit_code:{proc.returncode}, "
+                f"stdout:{_clip(proc.stdout)}, "
+                f"stderr:{_clip(proc.stderr)}\n")
 
     except subprocess.TimeoutExpired:
         _audit("python_exec", {"code_len": len(code)}, False, "timeout")
@@ -418,26 +349,8 @@ def python_exec(code: str, timeout: int = None):
 
 
 # =========================================================
-# 网络沙箱
+# 网络（无主机白名单）
 # =========================================================
-def _check_host(url: str):
-    if not CFG.allow_network:
-        raise SandboxError("沙箱未开启网络访问")
-
-    from urllib.parse import urlparse
-    parsed = urlparse(url)
-    scheme = (parsed.scheme or "").lower()
-    if scheme not in ("http", "https"):
-        raise SandboxError(f"只允许 http/https，当前 scheme: {scheme or '空'}")
-
-    if CFG.allowed_hosts is None:
-        return
-
-    host = parsed.hostname or ""
-    if not any(host == h or host.endswith("." + h) for h in CFG.allowed_hosts):
-        raise SandboxError(f"目标主机 {host} 不在白名单内")
-
-
 def http_request(
         url: str,
         method: str = "GET",
@@ -447,7 +360,8 @@ def http_request(
         data: str = None,
         timeout: int = 30,
 ):
-    _check_host(url)
+    if not CFG.allow_network:
+        raise SandboxError("网络访问已被禁用")
 
     if params:
         sep = "&" if "?" in url else "?"
@@ -512,9 +426,9 @@ _UNARY_OPS = {"UAdd": lambda a: +a, "USub": lambda a: -a}
 
 
 def git_info():
-    """
-    返回沙箱运行环境的基本系统信息，以及沙箱根目录的 Git 状态（如果适用）。
-    """
+    """返回运行环境的基本系统信息，以及 CFG.root 的 Git 状态（如果适用）。"""
+    import platform
+
     info = {
         "os_system": platform.system(),
         "os_release": platform.release(),
@@ -524,38 +438,34 @@ def git_info():
         "read_only_mode": CFG.read_only,
     }
 
-    # 尝试安全地获取沙箱根目录的 Git 信息
     if CFG.allow_shell:
         try:
-            # 1. 检查是否是 git 仓库
             rev_parse = subprocess.run(
                 ["git", "rev-parse", "--is-inside-work-tree"],
                 cwd=str(CFG.root),
                 capture_output=True,
                 text=True,
-                timeout=3
+                timeout=3,
             )
             if rev_parse.returncode == 0 and rev_parse.stdout.strip() == "true":
                 info["is_git_repo"] = True
 
-                # 2. 获取当前分支
                 branch = subprocess.run(
                     ["git", "branch", "--show-current"],
                     cwd=str(CFG.root),
                     capture_output=True,
                     text=True,
-                    timeout=3
+                    timeout=3,
                 )
                 if branch.returncode == 0:
                     info["git_branch"] = branch.stdout.strip() or "detached HEAD"
 
-                # 3. 获取最新 commit 短哈希
                 commit = subprocess.run(
                     ["git", "rev-parse", "--short", "HEAD"],
                     cwd=str(CFG.root),
                     capture_output=True,
                     text=True,
-                    timeout=3
+                    timeout=3,
                 )
                 if commit.returncode == 0:
                     info["git_commit"] = commit.stdout.strip()
@@ -564,7 +474,7 @@ def git_info():
         except Exception:
             info["git_status"] = "check_failed_or_git_not_installed"
     else:
-        info["git_status"] = "shell_execution_disabled_in_sandbox"
+        info["git_status"] = "shell_execution_disabled"
 
     _audit("git_info", {}, True)
     return info
@@ -615,25 +525,25 @@ def get_current_time(timezone: str = "Asia/Shanghai"):
 # 记忆
 # =========================================================
 def _memory_file() -> Path:
- return Path("agent_memory.txt")
+    return Path("agent_memory.txt")
 
 
 def memory_save(value: str):
- _check_write_allowed()
- one_line = " ".join(str(value).splitlines())
- p = _memory_file()
- f = p.open("a", encoding="utf-8")
- print(one_line, file=f)
- f.close()
- _audit("memory_save", {"value_len": len(one_line)}, True)
- return {"ok": True, "value": one_line}
+    one_line = " ".join(str(value).splitlines())
+    p = _memory_file()
+    f = p.open("a", encoding="utf-8")
+    print(one_line, file=f)
+    f.close()
+    _audit("memory_save", {"value_len": len(one_line)}, True)
+    return {"ok": True, "value": one_line}
 
 
 def memory_recall():
- p = _memory_file()
- text = p.read_text(encoding="utf-8") if p.exists() else ""
- lines2 = [ln for ln in text.splitlines() if ln.strip()]
- return {"count": len(lines2), "lines": lines2}
+    p = _memory_file()
+    text = p.read_text(encoding="utf-8") if p.exists() else ""
+    lines2 = [ln for ln in text.splitlines() if ln.strip()]
+    return {"count": len(lines2), "lines": lines2}
+
 
 # =========================================================
 # 工具注册（schema + 分发）
@@ -643,11 +553,11 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "读取沙箱内的文本文件。",
+            "description": "读取文本文件。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "相对沙箱根的路径"},
+                    "path": {"type": "string", "description": "文件路径"},
                     "encoding": {"type": "string",
                                  "enum": ["utf-8", "gbk", "ascii"],
                                  "default": "utf-8"},
@@ -660,7 +570,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "写入沙箱内文件，可追加。",
+            "description": "写入文件，可追加。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -679,7 +589,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "list_directory",
-            "description": "列出沙箱内目录。",
+            "description": "列出目录。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -693,7 +603,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "delete_file",
-            "description": "删除沙箱内文件。",
+            "description": "删除文件。",
             "parameters": {
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
@@ -705,7 +615,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "delete_directory",
-            "description": "删除沙箱内目录（可递归）。",
+            "description": "删除目录（可递归）。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -720,7 +630,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "search_files",
-            "description": "在沙箱内按 glob 搜索文件。",
+            "description": "按 glob 搜索文件。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -735,7 +645,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "grep",
-            "description": "在沙箱内按正则搜索文件内容。",
+            "description": "按正则搜索文件内容。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -752,7 +662,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "execute_shell",
-            "description": "在沙箱工作目录下执行白名单内的 shell 命令。",
+            "description": "执行 shell 命令。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -768,7 +678,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "python_exec",
-            "description": "在沙箱隔离环境中执行 Python 代码。",
+            "description": "执行 Python 代码。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -783,7 +693,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "http_request",
-            "description": "发起 HTTP 请求（受主机白名单限制）。",
+            "description": "发起 HTTP 请求。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -853,7 +763,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "git_info",
-            "description": "获取沙箱运行环境的基本系统信息（OS、Python版本等），以及沙箱根目录的 Git 仓库状态（分支、Commit等）。",
+            "description": "获取运行环境的基本系统信息，以及工作目录的 Git 仓库状态。",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -896,11 +806,10 @@ def execute_tool(name: str, arguments):
     try:
         result = fn(**(arguments or {}))
     except SandboxError as e:
-        result = {"error": f"沙箱拒绝: {e}"}
+        result = {"error": f"执行拒绝: {e}"}
     except Exception as e:
         result = {"error": f"{type(e).__name__}: {e}"}
 
-    # 统一出口：字符串直接返回，其他转 JSON 文本
     if isinstance(result, str):
         return result
     return json.dumps(result, ensure_ascii=False)

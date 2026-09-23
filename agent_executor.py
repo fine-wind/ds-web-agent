@@ -11,7 +11,7 @@ from pathlib import Path
 from logging.handlers import RotatingFileHandler
 import threading
 import time
-from sandbox import TOOLS, execute_tool, SandboxConfig, CFG
+from toolUtil import TOOLS, execute_tool, CFG
 
 try:
     import websockets
@@ -19,7 +19,7 @@ except ImportError:
     websockets = None
 
 # ---------- 配置（支持环境变量） ----------
-WORK_DIR_ENV = os.getenv("AGENT_WORK_DIR", None)
+WORK_DIR_ENV = os.getenv("AGENT_WORK_DIR", "/work")
 WS_HOST = os.getenv("AGENT_WS_HOST", "127.0.0.1")
 WS_PORT = int(os.getenv("AGENT_WS_PORT", 8765))
 
@@ -30,10 +30,7 @@ LLAMA_TIMEOUT = int(os.getenv("AGENT_LLAMA_TIMEOUT", 600))
 
 # ---------- 工作目录 ----------
 AGENT_DIR = Path(__file__).parent
-if WORK_DIR_ENV:
-    WORK_DIR = Path(WORK_DIR_ENV).resolve()
-else:
-    WORK_DIR = AGENT_DIR / "agent_workspace"
+WORK_DIR = Path(WORK_DIR_ENV).resolve()
 WORK_DIR.mkdir(exist_ok=True, parents=True)
 
 # ---------- 日志配置（轮转） ----------
@@ -48,16 +45,17 @@ if not logger.handlers:
     console.setLevel(logging.INFO)
     logger.addHandler(console)
 
-# ---------- 沙箱配置（绑定到 WORK_DIR） ----------
+# ---------- 配置（已去掉沙箱约束） ----------
 CFG.root = Path(WORK_DIR).resolve()
 CFG.root.mkdir(parents=True, exist_ok=True)
 CFG.read_only = False
 CFG.allow_shell = True
 CFG.allow_python = True
 CFG.allow_network = True
-CFG.allowed_hosts = None
-CFG.shell_whitelist = []          # ← 不再检查命令白名单
+CFG.shell_whitelist = []          # 空 = 不做命令白名单检查
+CFG.allowed_hosts = None          # None = 网络全部放行
 CFG.audit_log = CFG.root / "audit.log"
+
 
 def load_web_prompt():
     """读取 prompt.md 作为系统提示词，供客户端 AI 使用。"""
@@ -68,14 +66,16 @@ def load_web_prompt():
             return text
     return ""
 
+
 def load_local_system_prompt():
-    """给本地 LLM 用的 system prompt。优先读 local_system.md，否则用内置。"""
+    """给本地 LLM 用的 system prompt。优先读 prompt_local_llm.md，否则用内置。"""
     f = AGENT_DIR / "prompt_local_llm.md"
     if f.exists():
         text = f.read_text(encoding='utf-8').strip()
         if text:
             return text
     return ""
+
 
 # ---------- 响应封装 ----------
 def make_response(status, data=None, message=None):
@@ -94,7 +94,7 @@ def chat_completion(messages,
                     api_key=None,
                     model=None,
                     temperature=0.7,
-                    stream=False,  # ← 新增
+                    stream=False,
                     timeout=None):
     host = host or LLAMA_HOST
     api_key = api_key or LLAMA_API_KEY
@@ -242,14 +242,13 @@ async def handle_client_message(data, request_id):
         return make_response("error",
                              message=f"content 字段类型错误: {type(content).__name__}")
     if not content.strip():
-        # 客户端有时会在 AI 还没渲染出文本时发空内容，直接跳过
         return make_response("skipped", message="content 为空，已跳过")
 
     # ---- 组装 messages 并跑 Agent ----
     try:
         system_prompt = load_local_system_prompt()
     except Exception as e:
-        logger.warning(f"加载 prompt.md 失败，使用默认: {e}")
+        logger.warning(f"加载 prompt 失败，使用默认: {e}")
         system_prompt = ""
 
     messages = [
@@ -258,18 +257,16 @@ async def handle_client_message(data, request_id):
     ]
 
     logger.info(f"开始 Agent 循环，用户消息 {len(content)} 字符")
-    logger.info(f"😊 : {messages[1]["content"]}")
+    logger.info(f"😊 : {messages[1]['content']}")
     try:
         outcome = await asyncio.to_thread(run_agent_once, chat_completion, messages)
 
         if outcome["type"] == "text":
-            # 模型没调工具，直接返回文本
             content_ = outcome["content"]
             if "不关我事" in content_:
                 return make_response("success", data="")
             return make_response("success", data="小牛：" + content_)
 
-        # 模型调了工具，返回工具执行结果
         return make_response("success", data="小牛：" + outcome["content"])
 
     except Exception as e:
@@ -340,7 +337,7 @@ if __name__ == '__main__':
         exit(1)
 
     print("🚀 Agent WebSocket 服务启动中")
-    print(f"📁 工作目录 (沙箱根): {WORK_DIR}")
+    print(f"📁 工作目录 (默认相对根): {WORK_DIR}")
     print(f"🔌 WebSocket 监听地址: {WS_HOST}:{WS_PORT}")
     print(f"🧠 模型接口: {LLAMA_HOST}  model={LLAMA_MODEL}")
     print(f"📋 日志文件: {LOG_FILE} (轮转: 10MB/5备份)")
@@ -348,8 +345,7 @@ if __name__ == '__main__':
     local_prompt_file = AGENT_DIR / "prompt_local_llm.md"
     print(f"📝 网页 AI 提示词: {web_prompt_file if web_prompt_file.exists() else '内置默认'}")
     print(f"🧠 本地 LLM 提示词: {local_prompt_file if local_prompt_file.exists() else '内置默认'}")
-    print(f"🧰 沙箱允许的主机: {CFG.allowed_hosts}")
-    print(f"🧰 沙箱 shell 白名单: {CFG.shell_whitelist}")
+    print(f"🧰 沙箱约束: 已全部解除（路径/命令/网络无限制）")
 
 
     async def start_ws():
