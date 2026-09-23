@@ -55,7 +55,8 @@ CFG.read_only = False
 CFG.allow_shell = True
 CFG.allow_python = True
 CFG.allow_network = True
-CFG.allowed_hosts = ["127.0.0.1", "localhost", "api.example.com"]  # 想完全放开就设 None
+CFG.allowed_hosts = None
+CFG.shell_whitelist = []          # ← 不再检查命令白名单
 CFG.audit_log = CFG.root / "audit.log"
 
 def load_web_prompt():
@@ -264,7 +265,7 @@ async def handle_client_message(data, request_id):
         if outcome["type"] == "text":
             # 模型没调工具，直接返回文本
             content_ = outcome["content"]
-            if "呵呵,不关我事" in content_:
+            if "不关我事" in content_:
                 return make_response("success", data="")
             return make_response("success", data="小牛：" + content_)
 
@@ -278,6 +279,8 @@ async def handle_client_message(data, request_id):
 
 # ---------- WebSocket 处理 ----------
 async def websocket_handler(websocket):
+    peer = getattr(websocket, "remote_address", None)
+    logger.info(f"✅ 客户端已连接: {peer}")
     try:
         async for message in websocket:
             # 二进制帧兼容
@@ -336,7 +339,7 @@ if __name__ == '__main__':
         print("❌ 未安装 websockets 库，请执行: pip install websockets")
         exit(1)
 
-    print("🚀 Agent WebSocket 服务启动")
+    print("🚀 Agent WebSocket 服务启动中")
     print(f"📁 工作目录 (沙箱根): {WORK_DIR}")
     print(f"🔌 WebSocket 监听地址: {WS_HOST}:{WS_PORT}")
     print(f"🧠 模型接口: {LLAMA_HOST}  model={LLAMA_MODEL}")
@@ -353,6 +356,7 @@ if __name__ == '__main__':
         async with websockets.serve(websocket_handler, WS_HOST, WS_PORT):
             await asyncio.Future()  # 永久运行
 
+    print("🚀 Agent WebSocket 服务启动完毕")
 
     try:
         asyncio.run(start_ws())

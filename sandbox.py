@@ -52,11 +52,7 @@ class SandboxConfig:
         self.max_timeout = max_timeout
 
         # 默认 shell 白名单：只允许这些命令前缀
-        self.shell_whitelist = shell_whitelist or [
-            "dir", "ls", "type", "cat", "echo", "find", "findstr",
-            "grep", "where", "which", "python", "python3", "pip",
-            "git", "node", "npm",
-        ]
+        self.shell_whitelist = shell_whitelist or []
 
         # 网络白名单：None 表示全部放行
         self.allowed_hosts = allowed_hosts
@@ -110,36 +106,12 @@ def _audit(tool: str, args: dict, ok: bool, extra: str = ""):
 # 路径沙箱
 # =========================================================
 def safe_path(user_path: str, must_exist: bool = False) -> Path:
-    """
-    把用户输入的路径解析到沙箱内部。任何逃逸都会抛 SandboxError。
-    """
     if user_path is None:
         user_path = "."
-
     p = Path(user_path)
-
-    # 相对路径 -> 相对沙箱根
-    if not p.is_absolute():
-        candidate = (CFG.root / p)
-    else:
-        candidate = p
-
-    # 解析 ..、符号链接
-    try:
-        resolved = candidate.resolve(strict=False)
-    except OSError as e:
-        raise SandboxError(f"路径解析失败: {e}") from e
-
-    # 必须落在沙箱根内
-    try:
-        resolved.relative_to(CFG.root)
-    except ValueError:
-        raise SandboxError(f"路径越界，禁止访问沙箱外: {user_path}")
-
-    if must_exist and not resolved.exists():
+    if must_exist and not p.exists():
         raise SandboxError(f"路径不存在: {user_path}")
-
-    return resolved
+    return p.resolve(strict=False)
 
 
 def _check_write_allowed():
@@ -643,34 +615,25 @@ def get_current_time(timezone: str = "Asia/Shanghai"):
 # 记忆
 # =========================================================
 def _memory_file() -> Path:
-    return Path("agent_memory.json")
+ return Path("agent_memory.txt")
 
 
-def memory_save(key: str, value: str):
-    _check_write_allowed()
-    p = _memory_file()
-    mem = {}
-    if p.exists():
-        try:
-            mem = json.loads(p.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            mem = {}
-    mem[key] = value
-    p.write_text(json.dumps(mem, ensure_ascii=False, indent=2), encoding="utf-8")
-    _audit("memory_save", {"key": key}, True)
-    return {"ok": True, "key": key}
+def memory_save(value: str):
+ _check_write_allowed()
+ one_line = " ".join(str(value).splitlines())
+ p = _memory_file()
+ f = p.open("a", encoding="utf-8")
+ print(one_line, file=f)
+ f.close()
+ _audit("memory_save", {"value_len": len(one_line)}, True)
+ return {"ok": True, "value": one_line}
 
 
-def memory_recall(key: str):
-    p = _memory_file()
-    if not p.exists():
-        return {"key": key, "value": None}
-    try:
-        mem = json.loads(p.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        mem = {}
-    return {"key": key, "value": mem.get(key)}
-
+def memory_recall():
+ p = _memory_file()
+ text = p.read_text(encoding="utf-8") if p.exists() else ""
+ lines2 = [ln for ln in text.splitlines() if ln.strip()]
+ return {"count": len(lines2), "lines": lines2}
 
 # =========================================================
 # 工具注册（schema + 分发）
@@ -864,14 +827,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "memory_save",
-            "description": "保存记忆（写入沙箱内 agent_memory.json）。",
+            "description": "保存一条记忆（追加一行到 agent_memory.txt）。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "key": {"type": "string"},
                     "value": {"type": "string"},
                 },
-                "required": ["key", "value"],
+                "required": ["value"],
             },
         },
     },
@@ -879,11 +841,11 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "memory_recall",
-            "description": "读取记忆。",
+            "description": "读取全部记忆（逐行返回）。",
             "parameters": {
                 "type": "object",
-                "properties": {"key": {"type": "string"}},
-                "required": ["key"],
+                "properties": {},
+                "required": [],
             },
         },
     },
