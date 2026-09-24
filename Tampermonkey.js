@@ -307,7 +307,7 @@
                 lastAIMessageKey = latest.key;
                 lastProcessedText = latest.text || '';
                 lastOver = false;
-                logInfo(lastAIMessageKey, `检测到新的 AI 消息 key=${latest.key}`, `${lastProcessedText.slice(0, 20)}...${lastProcessedText.slice(-20)}`);
+                logInfo(lastAIMessageKey, `新的AI消息 key=${latest.key}`, `${lastProcessedText.slice(0, 10)}...${lastProcessedText.slice(-10)}`);
                 return;
             }
 
@@ -338,7 +338,7 @@
             lastOver = true;
             processing = true;
 
-            logInfo(lastAIMessageKey + 'AI 回复内容预览:', `(长度: ${finalText.length})`, `${lastProcessedText.slice(0, 20)}...${lastProcessedText.slice(-20)}`);
+            logInfo(lastAIMessageKey + 'AI回复预览:', `len: ${finalText.length}`, `${lastProcessedText.slice(0, 10)}...${lastProcessedText.slice(-10)}`);
 
             if (!wsConnected) connectWebSocket();
 
@@ -416,6 +416,7 @@
                 });
         }
         setupDOMObserver();
+        setInterval(() => document.querySelectorAll('.ds-button--warning')[0]?.click(), 1000 * 60)
     }
 
     function stopAgent() {
