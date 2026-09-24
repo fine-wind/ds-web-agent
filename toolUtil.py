@@ -188,7 +188,9 @@ def read_file(path: str, encoding: str = "utf-8"):
 
     content = p.read_text(encoding=encoding)
     _audit("read_file", {"path": path}, True)
-    return f"文件：{_rel(p)}\n----------\n大小：{size}\n----------\n{content}"
+    hdr = json.dumps({"ok": 1, "tool": "read_file", "path": _rel(p), "bytes": size, "trunc": 0},
+                     ensure_ascii=False, separators=(",", ":"))
+    return f"已读取文件 {_rel(p)}（{size} 字节）：" + chr(10) + "---" + chr(10) + content
 
 
 def write_file(path: str, content: str, encoding: str = "utf-8", append: bool = False):
@@ -223,19 +225,19 @@ def list_directory(path: str = ".", recursive: bool = False):
     for child in iterator:
         try:
             stat = child.stat()
-            items.append(
-                f"名称：{child.relative_to(p).as_posix() if recursive else child.name}，"
-                f"是否文件夹：{child.is_dir()}，"
-                f"大小：{stat.st_size if child.is_file() else None}"
-            )
+            _is_dir = child.is_dir()
+            _name = child.relative_to(p).as_posix() if recursive else child.name
+            if _is_dir:
+                items.append("- " + _name + "（目录）")
+            else:
+                items.append("- " + _name + "（" + str(stat.st_size) + " 字节）")
         except OSError:
             continue
         if len(items) >= 500:
             break
 
     _audit("list_directory", {"path": path, "recursive": recursive}, True)
-    tail = "\n".join(items)
-    return f"路径：{_rel(p)}，数量：{len(items)}\n" + tail
+    return "目录 " + _rel(p) + " 共 " + str(len(items)) + " 项：" + chr(10) + chr(10).join(items)
 
 
 def delete_file(path: str):
@@ -402,9 +404,10 @@ def execute_shell(command: str, cwd: str = None, timeout: int = None):
         ok = proc.returncode == 0
         _audit("execute_shell", {"command": command, "cwd": cwd}, ok,
                f"exit={proc.returncode}")
-        return (f"exit_code:{proc.returncode}, "
-                f"stdout:{_clip(proc.stdout)}, "
-                f"stderr:{_clip(proc.stderr)}\n")
+        out = "命令执行" + ("完成" if ok else "失败") + "，退出码 " + str(proc.returncode) + "，输出如下：" + chr(10) + _clip(proc.stdout)
+        if proc.stderr:
+            out = out + chr(10) + "错误输出：" + chr(10) + _clip(proc.stderr)
+        return out
     except subprocess.TimeoutExpired:
         _audit("execute_shell", {"command": command}, False, "timeout")
         raise SandboxError(f"命令超时 (>{timeout}s)")
@@ -428,9 +431,10 @@ def python_exec(code: str, timeout: int = None):
         ok = proc.returncode == 0
         _audit("python_exec", {"code_len": len(code)}, ok,
                f"exit={proc.returncode}")
-        return (f"exit_code:{proc.returncode}, "
-                f"stdout:{_clip(proc.stdout)}, "
-                f"stderr:{_clip(proc.stderr)}\n")
+        out = "Python 执行" + ("完成" if ok else "失败") + "，退出码 " + str(proc.returncode) + "，输出如下：" + chr(10) + _clip(proc.stdout)
+        if proc.stderr:
+            out = out + chr(10) + "错误输出：" + chr(10) + _clip(proc.stderr)
+        return out
 
     except subprocess.TimeoutExpired:
         _audit("python_exec", {"code_len": len(code)}, False, "timeout")
@@ -894,24 +898,53 @@ TOOL_FUNCTIONS = {
 }
 
 
-def execute_tool(name: str, arguments):
+def _nl_result(name, result):
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        if result.get("ok") == 0 or ("error" in result and "ok" not in result):
+            err = result.get("error") or result.get("message") or "未知错误"
+            return name + " 失败：" + str(err) + "。"
+        parts = []
+        for k, v in result.items():
+            if k in ("ok", "tool", "error"):
+                continue
+            parts.append(str(k) + "=" + str(v))
+        tail = "，".join(parts)
+        if tail:
+            return name + " 执行完成：" + tail + "。"
+        return name + " 执行完成。"
+    return name + " 执行完成：" + str(result)
+
+
+def execute_tool(name, arguments):
     if isinstance(arguments, str):
         try:
             arguments = json.loads(arguments)
         except json.JSONDecodeError as e:
-            return f"参数不是合法 JSON: {e}"
-
+            return name + " 失败：参数不是合法 JSON: " + str(e) + "。"
     fn = TOOL_FUNCTIONS.get(name)
     if not fn:
-        return f"未知工具: {name}"
-
+        return "未知工具 " + name + "。"
     try:
         result = fn(**(arguments or {}))
     except SandboxError as e:
-        result = {"error": f"执行拒绝: {e}"}
+        return name + " 失败：执行拒绝: " + str(e) + "。"
     except Exception as e:
-        result = {"error": f"{type(e).__name__}: {e}"}
-
+        return name + " 失败：" + type(e).__name__ + ": " + str(e) + "。"
     if isinstance(result, str):
         return result
-    return json.dumps(result, ensure_ascii=False)
+    if isinstance(result, dict):
+        if result.get("ok") == 0 or ("error" in result and "ok" not in result):
+            err = result.get("error") or result.get("message") or "未知错误"
+            return name + " 失败：" + str(err) + "。"
+        parts = []
+        for k, v in result.items():
+            if k in ("ok", "tool", "error"):
+                continue
+            parts.append(str(k) + "=" + str(v))
+        tail = "，".join(parts)
+        if tail:
+            return name + " 执行完成：" + tail + "。"
+        return name + " 执行完成。"
+    return name + " 执行完成：" + str(result)

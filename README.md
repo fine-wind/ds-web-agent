@@ -11,19 +11,17 @@
 
 
 ```text
-用户 → 网页 AI（DeepSeek）→ 输出操作命令文本 → JS 捕获
-                                              ↓
-                                       WebSocket 发给 py
-                                              ↓
-                                    py 把这段文本发给本地 LLM
-                                              ↓
-                                    本地 LLM 推理 → 返回 tool_calls
-                                              ↓
-                                    py 执行工具 → 结果塞回本地 LLM
-                                              ↓
-                                    py 通过 WebSocket 返回给 JS
-                                              ↓
-                                    JS 把结果发回网页 AI
-                                              ↓
-                                    网页 AI 继续推理...
+用户 → 网页 AI → 输出操作命令文本 → JS 捕获
+                                  ↓
+                           WebSocket 发给 py
+                                  ↓
+                        py 把这段文本发给本地 LLM
+                                  ↓
+                        本地 LLM 推理 → 返回 tool_calls
+                                  ↓
+                        py 执行工具 → 结果通过 WebSocket 返回给 JS
+                                  ↓
+                        JS 把结果发回网页 AI
+                                  ↓
+                        网页 AI 继续推理...
 ```

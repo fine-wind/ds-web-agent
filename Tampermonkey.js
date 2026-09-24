@@ -464,8 +464,8 @@
 
         const container = document.createElement('div');
         container.className = 'agent-float-container';
-        container.style.cssText = 'display: flex;cursor: move; user-select: none;';
-        document.querySelectorAll('.ds-toggle-button')[0].parentElement.appendChild(container);
+        container.style.cssText = 'position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%); z-index: 9999; display: flex; gap: 8px; cursor: move; user-select: none;';
+        document.body.appendChild(container);
 
         // ---- Agent 开关按钮 ----
         const btn = document.createElement('div');

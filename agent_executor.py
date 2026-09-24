@@ -239,10 +239,14 @@ async def handle_client_message(data, request_id):
     if content is None:
         return make_response("error", message="缺少 content 字段")
     if not isinstance(content, str):
-        return make_response("error",
-                             message=f"content 字段类型错误: {type(content).__name__}")
+        return make_response("error", message=f"content 字段类型错误: {type(content).__name__}")
     if not content.strip():
         return make_response("skipped", message="content 为空，已跳过")
+
+    logger.info(f"消息 {content}")
+
+    if "@小牛" not in content:
+        return make_response("skipped", message="非小牛的消息")
 
     # ---- 组装 messages 并跑 Agent ----
     try:
@@ -256,7 +260,7 @@ async def handle_client_message(data, request_id):
         {"role": "user", "content": content},
     ]
 
-    logger.info(f"开始 Agent 循环，用户消息 {len(content)} 字符")
+    logger.info(f"开始 Agent 循环，消息 {len(content)} 字符")
     logger.info(f"😊 : {messages[1]['content']}")
     try:
         outcome = await asyncio.to_thread(run_agent_once, chat_completion, messages)

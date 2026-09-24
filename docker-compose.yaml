@@ -7,7 +7,7 @@ services:
       - "8765:8765"
     volumes:
       - ./:/app
-      - ./:/work
+      - ./work/:/work
     environment:
       AGENT_WS_HOST: 0.0.0.0
       AGENT_WS_PORT: "8765"
