@@ -23,7 +23,8 @@ except ImportError:
 class SandboxConfig:
     def __init__(
             self,
-            root: str = r"D:\temp",
+            root: str = "/work",
+            agent_zone: str = "/app",
             read_only: bool = False,
             allow_shell: bool = True,
             allow_python: bool = True,
@@ -37,6 +38,7 @@ class SandboxConfig:
             audit_log: str = None,
     ):
         self.root = Path(root).resolve()
+        self.agent_zone = Path(agent_zone).resolve()
         try:
             self.root.mkdir(parents=True, exist_ok=True)
         except OSError:
@@ -71,8 +73,15 @@ class SandboxError(Exception):
 
 
 def _audit(tool: str, args: dict, ok: bool, extra: str = ""):
+    if ZoneInfo is not None:
+        try:
+            _ts = datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(timespec="seconds")
+        except Exception:
+            _ts = datetime.now().isoformat(timespec="seconds")
+    else:
+        _ts = datetime.now().isoformat(timespec="seconds")
     entry = {
-        "ts": datetime.now().isoformat(timespec="seconds"),
+        "ts": _ts,
         "tool": tool,
         "args": args,
         "ok": ok,
@@ -121,6 +130,21 @@ def safe_path(user_path: str, must_exist: bool = False) -> Path:
     except OSError as e:
         raise SandboxError(f"路径解析失败: {e}") from e
 
+    _allowed_roots = [CFG.root]
+    _agent_zone = getattr(CFG, "agent_zone", None)
+    if _agent_zone is not None:
+        _allowed_roots.append(_agent_zone)
+    _ok = False
+    for _r in _allowed_roots:
+        try:
+            resolved.relative_to(_r)
+            _ok = True
+            break
+        except ValueError:
+            continue
+    if not _ok:
+        raise SandboxError(f"路径越界，不允许访问沙箱根之外: {user_path}")
+
     if must_exist and not resolved.exists():
         raise SandboxError(f"路径不存在: {user_path}")
 
@@ -143,6 +167,14 @@ def _clip(text: str) -> str:
 
 
 # =========================================================
+# 只读模式守卫
+# =========================================================
+def _check_writable():
+    if CFG.read_only:
+        raise SandboxError("沙箱处于只读模式，禁止写入操作")
+
+
+# =========================================================
 # 文件工具
 # =========================================================
 def read_file(path: str, encoding: str = "utf-8"):
@@ -160,6 +192,7 @@ def read_file(path: str, encoding: str = "utf-8"):
 
 
 def write_file(path: str, content: str, encoding: str = "utf-8", append: bool = False):
+    _check_writable()
     p = safe_path(path)
 
     data = content.encode(encoding)
@@ -168,7 +201,7 @@ def write_file(path: str, content: str, encoding: str = "utf-8", append: bool = 
 
     p.parent.mkdir(parents=True, exist_ok=True)
     mode = "a" if append else "w"
-    with p.open(mode, encoding=encoding) as f:
+    with p.open(mode, encoding=encoding, newline="\n") as f:
         f.write(content)
 
     _audit("write_file", {"path": path, "append": append, "bytes": len(data)}, True)
@@ -191,7 +224,7 @@ def list_directory(path: str = ".", recursive: bool = False):
         try:
             stat = child.stat()
             items.append(
-                f"名称：{str(child.relative_to(p)) if recursive else child.name}，"
+                f"名称：{child.relative_to(p).as_posix() if recursive else child.name}，"
                 f"是否文件夹：{child.is_dir()}，"
                 f"大小：{stat.st_size if child.is_file() else None}"
             )
@@ -206,6 +239,7 @@ def list_directory(path: str = ".", recursive: bool = False):
 
 
 def delete_file(path: str):
+    _check_writable()
     p = safe_path(path, must_exist=True)
     if p.is_dir():
         raise SandboxError("delete_file 只支持文件，目录请用 delete_directory")
@@ -216,6 +250,7 @@ def delete_file(path: str):
 
 
 def delete_directory(path: str, recursive: bool = False):
+    _check_writable()
     p = safe_path(path, must_exist=True)
     if not p.is_dir():
         raise SandboxError(f"不是目录: {path}")
@@ -263,8 +298,13 @@ def grep(pattern: str, path: str = ".", file_glob: str = "*", max_results: int =
     regex = _compile_safe_regex(pattern)
     matches = []
 
-    for p in root.rglob("*"):
-        if not p.is_file() or not fnmatch.fnmatch(p.name, file_glob):
+    if root.is_file():
+        candidates = [root]
+    else:
+        candidates = [p for p in root.rglob("*") if p.is_file()]
+
+    for p in candidates:
+        if not fnmatch.fnmatch(p.name, file_glob):
             continue
 
         try:
@@ -288,11 +328,60 @@ def grep(pattern: str, path: str = ".", file_glob: str = "*", max_results: int =
 
 
 # =========================================================
-# Shell 执行（无白名单、无黑名单、无环境裁剪）
+# Shell 安全策略（Linux）
+# =========================================================
+_SHELL_DANGEROUS_PATTERNS = [
+    (r'\brm\s+(-[a-zA-Z]+\s+)*/(\s|$)', '禁止删除根目录'),
+    (r'\bdd\s+.*of=/dev/(sd|hd|nvme|vd|mmcblk)', '禁止写入块设备'),
+    (r'\bmkfs(\.\w+)?\b', '禁止格式化文件系统'),
+    (r'\b(shutdown|reboot|halt|poweroff)\b', '禁止关机/重启'),
+    (r'\binit\s+[06]\b', '禁止 init 0/6'),
+    (r':\(\)\s*\{.*?\}\s*;\s*:', '禁止 fork bomb'),
+    (r'>\s*/etc/(passwd|shadow|sudoers|fstab|hosts)', '禁止写入系统关键文件'),
+    (r'\b(curl|wget)\s+[^|]*\|\s*(sh|bash|zsh)\b', '禁止远程脚本直接执行'),
+    (r'\bchmod\s+(-[a-zA-Z]+\s+)*777\s+/(\s|$)', '禁止对根目录 chmod 777'),
+    (r'\bexport\s+(PATH|LD_PRELOAD|LD_LIBRARY_PATH)\s*=', '禁止覆盖关键环境变量'),
+    (r'>\s*/dev/(sd|hd|nvme|vd|mmcblk)', '禁止写入块设备'),
+]
+
+_SENSITIVE_ENV_KEYS = (
+    'KEY', 'TOKEN', 'SECRET', 'PASSWORD', 'PASSWD',
+    'CREDENTIAL', 'API_KEY', 'PRIVATE',
+)
+
+
+def _check_shell_safety(command: str):
+    for pattern, reason in _SHELL_DANGEROUS_PATTERNS:
+        if re.search(pattern, command, re.IGNORECASE):
+            raise SandboxError(f"命令被安全策略拒绝: {reason}")
+
+
+def _sanitize_env(env: dict) -> dict:
+    cleaned = {}
+    for k, v in env.items():
+        upper = k.upper()
+        if any(s in upper for s in _SENSITIVE_ENV_KEYS):
+            continue
+        cleaned[k] = v
+    return cleaned
+
+
+# =========================================================
+# Shell 执行（Linux，含安全策略）
 # =========================================================
 def execute_shell(command: str, cwd: str = None, timeout: int = None):
     if not CFG.allow_shell:
         raise SandboxError("shell 执行已被禁用")
+
+    _check_shell_safety(command)
+
+    if CFG.shell_whitelist:
+        stripped = command.strip()
+        if not stripped:
+            raise SandboxError("空命令")
+        first_word = stripped.split()[0]
+        if first_word not in CFG.shell_whitelist:
+            raise SandboxError(f"命令 {first_word} 不在白名单中")
 
     workdir = safe_path(cwd or ".")
     if not workdir.is_dir():
@@ -308,7 +397,7 @@ def execute_shell(command: str, cwd: str = None, timeout: int = None):
             capture_output=True,
             text=True,
             timeout=timeout,
-            env=os.environ.copy(),
+            env=_sanitize_env(os.environ.copy()),
         )
         ok = proc.returncode == 0
         _audit("execute_shell", {"command": command, "cwd": cwd}, ok,
@@ -334,7 +423,7 @@ def python_exec(code: str, timeout: int = None):
             text=True,
             timeout=timeout,
             cwd=str(CFG.root),
-            env=os.environ.copy(),
+            env=_sanitize_env(os.environ.copy()),
         )
         ok = proc.returncode == 0
         _audit("python_exec", {"code_len": len(code)}, ok,
@@ -362,6 +451,12 @@ def http_request(
 ):
     if not CFG.allow_network:
         raise SandboxError("网络访问已被禁用")
+
+    if CFG.allowed_hosts is not None:
+        from urllib.parse import urlparse
+        _host = urlparse(url).hostname or ""
+        if not any(_host == h or _host.endswith("." + h) for h in CFG.allowed_hosts):
+            raise SandboxError(f"主机 {_host} 不在白名单中")
 
     if params:
         sep = "&" if "?" in url else "?"
@@ -471,8 +566,11 @@ def git_info():
                     info["git_commit"] = commit.stdout.strip()
             else:
                 info["is_git_repo"] = False
+                info["git_status"] = "not_a_git_repo"
+        except FileNotFoundError:
+            info["git_status"] = "git_not_installed"
         except Exception:
-            info["git_status"] = "check_failed_or_git_not_installed"
+            info["git_status"] = "check_failed"
     else:
         info["git_status"] = "shell_execution_disabled"
 
@@ -511,7 +609,10 @@ def calculate(expression: str):
 
 def get_current_time(timezone: str = "Asia/Shanghai"):
     if ZoneInfo is not None:
-        now = datetime.now(ZoneInfo(timezone))
+        try:
+            now = datetime.now(ZoneInfo(timezone))
+        except Exception:
+            now = datetime.now()
     else:
         now = datetime.now()
     return {
@@ -525,15 +626,16 @@ def get_current_time(timezone: str = "Asia/Shanghai"):
 # 记忆
 # =========================================================
 def _memory_file() -> Path:
-    return Path("agent_memory.txt")
+    return CFG.root / "agent_memory.txt"
 
 
 def memory_save(value: str):
     one_line = " ".join(str(value).splitlines())
     p = _memory_file()
-    f = p.open("a", encoding="utf-8")
-    print(one_line, file=f)
-    f.close()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with CFG._lock:
+        with p.open("a", encoding="utf-8", newline="\n") as f:
+            print(one_line, file=f)
     _audit("memory_save", {"value_len": len(one_line)}, True)
     return {"ok": True, "value": one_line}
 
