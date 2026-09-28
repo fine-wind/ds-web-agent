@@ -12,7 +12,6 @@
 (function () {
     'use strict';
 
-    const DEFAULT_PROMPT = `你好`;
     // ============ 配置 ============
     const WS_URL = 'ws://localhost:8765';
     // ============ 状态 ============
@@ -20,7 +19,7 @@
     const SILENT_WAIT = 1000;   // 静默时间（ms）
     const SILENT_TEXT_ROUND = 5;   // 静默轮次
     let processing = false;      // 是否正在执行任务
-    let iteration = 0;           // 已执行步数
+    let READ_CHAT_BY_S = 14.5;           // 每秒钟能阅读多少文字
     // WebSocket 相关
     let ws = null;
     let wsConnected = false;
@@ -29,7 +28,7 @@
     let wsReconnectTimer = null;
     // DOM 观察器
     let observerTimer = null;
-    const box = document.createElement('div');
+    const box = document.createElement('div');// log box
     box.style.cssText = `position: fixed;right: 20px;bottom: 20px;display: flex;flex-direction: column;gap: 10px;z-index: 9999;`;
     document.body.appendChild(box);
 
@@ -41,6 +40,7 @@
             warning: '#ef6c00'
         };
         const bg = colors[type] || colors.info;
+        console[type](new Date().toLocaleTimeString(), ...msg);
 
         const div = document.createElement('div');
         div.textContent = msg.join(", ");
@@ -52,33 +52,20 @@
             div.style.transform = 'translateY(0)';
         });
 
-        setTimeout(() => {
+        const closeDiv = () => {
             div.style.opacity = 0;
             div.style.transform = 'translateY(20px)';
             setTimeout(() => div.remove(), 300);
-        }, ms);
+        };
+        setTimeout(closeDiv, ms);
+        return closeDiv;
     }
-
-    // ============ 日志工具 ============
-    function logInfo(...args) {
-        console.log('[Agent]', ...args);
-        toast({}, ...args);
-    }
-
-    function logWarn(...args) {
-        console.warn('[Agent]', ...args);
-        toast({type: "warning"}, ...args);
-    }
-
-    function logError(...args) {
-        console.error('[Agent]', ...args);
-        toast({type: "error"}, ...args);
-    }
-
 
     // ============ 通过虚拟列表 key 获取最新 AI 消息 ============
     function getLatestAIMessage() {
-        document.querySelectorAll('.code-info-button-text').forEach(el => {el.textContent = '';});
+        document.querySelectorAll('.code-info-button-text').forEach(el => {
+            el.textContent = '';
+        });
         let items = document.querySelectorAll('[data-virtual-list-item-key]');
         if (!items.length) return null;
 
@@ -97,10 +84,10 @@
         if ((text || '').length < 1) {
             return;
         }
-        logInfo('📤 发送消息:', text.slice(0, 20) + '...');
+        toast({}, '📤🌐:', text.slice(0, 20) + '...');
         const ta = document.querySelector('textarea[placeholder*="发送消息"]');
         if (!ta) {
-            logError('未找到输入框');
+            toast({type: "error"}, '未找到输入框');
             return;
         }
         ta.focus();
@@ -130,7 +117,7 @@
         }
         if (sendBtn) {
             sendBtn.click();
-            logInfo('✅ 点击发送按钮');
+            toast({}, '✅ 点击发送按钮');
             setTimeout(() => {
                 if (ta.value !== '') {
                     ta.value = '';
@@ -140,29 +127,29 @@
         } else {
             ta.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true}));
             ta.dispatchEvent(new KeyboardEvent('keyup', {key: 'Enter', bubbles: true}));
-            logInfo('⚠️ 未找到发送按钮，模拟 Enter 键');
+            toast({}, '⚠️ 未找到发送按钮，模拟 Enter 键');
         }
     }
 
     // ============ WebSocket 客户端 ============
     function connectWebSocket() {
         if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-            logInfo('WebSocket 已连接或正在连接');
+            toast({}, 'WebSocket 已连接或正在连接');
             return;
         }
 
-        logInfo(`🔄 尝试连接 WebSocket: ${WS_URL}`);
+        toast({}, `🔄 尝试连接 WebSocket: ${WS_URL}`);
         try {
             ws = new WebSocket(WS_URL);
         } catch (e) {
-            logError('创建 WebSocket 失败:', e);
+            toast({type: "error"}, '创建 WebSocket 失败:', e);
             scheduleReconnect();
             return;
         }
 
         ws.onopen = function () {
             wsConnected = true;
-            logInfo('✅ WebSocket 已连接');
+            toast({}, '✅ WebSocket 已连接');
             // 重连后旧的 pending 请求全部 reject，避免内存泄漏和永久 pending
             const ids = Array.from(pendingRequests.keys());
             for (const id of ids) {
@@ -183,7 +170,7 @@
             try {
                 data = JSON.parse(event.data);
             } catch (e) {
-                logError('WebSocket 收到非 JSON 消息:', event.data);
+                toast({type: "error"}, 'WebSocket 收到非 JSON 消息:', event.data);
                 return;
             }
             const requestId = data.id;
@@ -193,17 +180,17 @@
                 pendingRequests.delete(requestId);
                 pending.resolve(data);
             } else {
-                logInfo('收到未关联请求的响应:', data);
+                toast({}, '收到未关联请求的响应:', data);
             }
         };
 
         ws.onerror = function (err) {
-            logError('WebSocket 错误:', err);
+            toast({type: "error"}, 'WebSocket 错误:', err);
             wsConnected = false;
         };
 
         ws.onclose = function () {
-            logWarn('WebSocket 连接关闭');
+            toast({type: "warning"}, 'WebSocket 连接关闭');
             wsConnected = false;
             ws = null;
             scheduleReconnect();
@@ -238,7 +225,8 @@
 
             try {
                 ws.send(JSON.stringify(message));
-                logInfo(`🚀 WebSocket 发送: ${JSON.stringify(payload).slice(0, 20)}`);
+                let s = JSON.stringify(payload);
+                toast({ms: 5000}, `🚀${s.length}📄${s.slice(0, 20)},...${s.slice(-10)}`);
             } catch (e) {
                 clearTimeout(timeout);
                 pendingRequests.delete(id);
@@ -286,7 +274,7 @@
         if (observerTimer) {
             clearInterval(observerTimer);
             observerTimer = null;
-            logInfo('监听 AI 回复已停止');
+            toast({}, '监听 AI 回复已停止');
         }
     }
 
@@ -297,6 +285,8 @@
         let lastProcessedText = '';  // 上一次文本
         let textRound = 1;  // 上一次文本
         let lastOver = false;        // 该条消息是否已处理完
+        let lastTime = new Date().getTime();        // 该条消息是否已处理完
+        let lastTimeout = -1;        // 该条消息是否已处理完
 
         observerTimer = setInterval(() => {
             const latest = getLatestAIMessage();
@@ -307,7 +297,8 @@
                 lastAIMessageKey = latest.key;
                 lastProcessedText = latest.text || '';
                 lastOver = false;
-                logInfo(lastAIMessageKey, `新的AI消息 key=${latest.key}`, `${lastProcessedText.slice(0, 10)}...${lastProcessedText.slice(-10)}`);
+                lastTime = new Date().getTime();
+                toast({}, lastAIMessageKey, `新的AI消息 key=${latest.key}`, `${lastProcessedText.slice(0, 10)}...${lastProcessedText.slice(-10)}`);
                 return;
             }
 
@@ -321,40 +312,40 @@
                 return;
             }
             if (lastOver) {
-                toast({ms: 1000}, lastAIMessageKey + ` 文本稳定 → 判定回复完毕`);
+                // toast({ms: 1000}, lastAIMessageKey + ` 文本稳定 → 判定回复完毕`);
                 return;
             }
 
             textRound++;
             if (textRound < SILENT_TEXT_ROUND) {
-                logInfo(lastAIMessageKey + ` 轮次未到，继续等待 ${textRound}/${SILENT_TEXT_ROUND}`)
+                toast({ms: 5000}, lastAIMessageKey + ` 轮次未到，继续等待 ${textRound}/${SILENT_TEXT_ROUND}`)
             }
 
             if (!isRunning || processing) {
-                logInfo(lastAIMessageKey + `运行状态：${isRunning}`, `任务状态：${isRunning}`)
+                toast({ms: 5000}, lastAIMessageKey + `运行状态：${isRunning}`, `任务状态：${isRunning}`)
                 return;
             }
 
             lastOver = true;
             processing = true;
 
-            logInfo(lastAIMessageKey + 'AI回复预览:', `len: ${finalText.length}`, `${lastProcessedText.slice(0, 10)}...${lastProcessedText.slice(-10)}`);
+            let closeDiv = toast({ms: 500000}, lastAIMessageKey + '🤖回复预览:', `len: ${finalText.length}`, `${lastProcessedText.slice(0, 10)}...${lastProcessedText.slice(-10)}`);
 
             if (!wsConnected) connectWebSocket();
-
+            clearTimeout(lastTimeout);
             sendWebSocketRequest({content: finalText})
                 .then(result => {
-                    logInfo(lastAIMessageKey, '后端处理结果:', result);
-
+                    toast({}, lastAIMessageKey, '后端处理结果:', result);
+                    closeDiv();
                     // 后端判定为非操作类，跳过：不回灌消息，避免死循环
                     if (result.status === 'skipped') {
-                        logInfo(lastAIMessageKey, '后端跳过该消息:', result.message || '');
+                        toast({}, lastAIMessageKey, '后端跳过该消息:', result.message || '');
                         processing = false;
                         return;
                     }
 
-                    let msg;
                     if (result.status === 'success') {
+                        let msg;
                         const data = result.data;
                         let dataStr;
                         if (data === null || data === undefined) {
@@ -367,23 +358,29 @@
                             dataStr = String(data);
                         }
                         msg = dataStr;
-                        sendMessageToWeb(msg);
+                        const needMs = (finalText.length / READ_CHAT_BY_S) * 1000;
+                        const remaining = Math.max(needMs - (Date.now() - lastTime), 0);
+                        toast({ms: remaining}, `🐂：${msg.slice(0, 10)}...${msg.slice(-10)}`)
+
+                        lastTimeout = setTimeout(() => {
+                            sendMessageToWeb(msg);
+                        }, remaining);
                     } else {
-                        msg = `执行结果：操作失败，${result.message || '未知错误'}`;
                         // 出错时允许重新处理同一 AI 消息
+                        toast({type: 'error', ms: 10000}, `执行结果：操作失败，${result.message || '未知错误'}`)
                         lastOver = false;
                         stopDOMObserver();
                     }
                     processing = false;
                 })
                 .catch(err => {
-                    logError('后端处理请求失败:', err);
+                    toast({type: "error"}, '后端处理请求失败:', err);
                     lastOver = false;
                     processing = false;
                 });
         }, SILENT_WAIT);
 
-        logInfo(lastAIMessageKey, `监听 AI 回复已启动（周期 ${SILENT_WAIT}ms）`);
+        toast({}, lastAIMessageKey, `监听 AI 回复已启动（周期 ${SILENT_WAIT}ms）`);
     }
 
     function sendPromptOnce(prompt) {
@@ -391,7 +388,7 @@
         let key = 'agent_prompt_sent' + pathname;
         if (pathname.length < 10) {
             sendMessageToWeb(prompt);
-            logInfo('系统提示词已发送');
+            toast({}, '系统提示词已发送');
             setTimeout(() => {
                 localStorage.setItem('agent_prompt_sent' + location.pathname, 'true');
             }, 3000)
@@ -399,7 +396,7 @@
     }
 
     function startAgent(skipPrompt) {
-        logInfo('启动 Agent');
+        toast({}, '启动 Agent');
         processing = false;
 
         if (!wsConnected) connectWebSocket();
@@ -407,11 +404,11 @@
         if (!skipPrompt && !(location.pathname || '').length < 5) {
             getPromptViaWebSocket()
                 .then(prompt => {
-                    logInfo('获取到服务端提示词');
+                    toast({}, '获取到服务端提示词');
                     sendPromptOnce(prompt);
                 })
                 .catch(err => {
-                    logError('获取提示词失败:' + err);
+                    toast({type: "error"}, '获取提示词失败:' + err);
                     stopAgent();
                 });
         }
@@ -420,7 +417,7 @@
     }
 
     function stopAgent() {
-        logInfo('停止 Agent');
+        toast({}, '停止 Agent');
         isRunning = false;
         processing = false;
 
@@ -456,7 +453,7 @@
             if (span) span.textContent = 'Agent';
             btn.style.backgroundColor = '';
         }
-        logInfo('已停止');
+        toast({}, '已停止');
     }
 
     // ============ 悬浮按钮容器 ============
