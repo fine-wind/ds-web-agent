@@ -40,7 +40,7 @@
             warning: '#ef6c00'
         };
         const bg = colors[type] || colors.info;
-        console[type](new Date().toLocaleTimeString(), ...msg);
+        (console[type] || console.error)(new Date().toLocaleTimeString(), ...msg);
 
         const div = document.createElement('div');
         div.textContent = msg.join(", ");
@@ -66,15 +66,34 @@
         document.querySelectorAll('.code-info-button-text').forEach(el => {
             el.textContent = '';
         });
-        let items = document.querySelectorAll('[data-virtual-list-item-key]');
+        var items = document.querySelectorAll('[data-virtual-list-item-key]');
         if (!items.length) return null;
-
-        let item = items[items.length - 1];
-        let key = item.dataset.virtualListItemKey;
-        let latest = key % 2 === 0 ? item : null;
+        var item = items[items.length - 1];
+        var key = item?.dataset?.virtualListItemKey;
+        var latest = key % 2 === 0 ? item : null;
         if (!latest) return null;
-        let childNode = latest.querySelectorAll(':scope > .ds-message')[0];
+        var childNode = latest.querySelectorAll(':scope > .ds-message')[0];
         childNode = childNode.querySelectorAll(':scope > .ds-assistant-message-main-content')[0];
+        childNode = childNode.cloneNode(true)
+        childNode.removeAttribute('style');
+        childNode.querySelectorAll('svg').forEach(el => {
+            if (el.parentNode) {
+                el.parentNode.removeChild(el);
+            }
+        });
+        childNode.querySelectorAll('[style]').forEach(el => {
+            el.removeAttribute('style');
+        });
+        childNode.querySelectorAll('[class]').forEach(el => {
+            el.removeAttribute('class');
+        });
+        childNode.querySelectorAll('div:empty, span:empty').forEach(el => el.remove());
+        childNode.querySelectorAll('div:empty, span:empty').forEach(el => el.remove());
+        childNode.querySelectorAll('div:empty, span:empty').forEach(el => el.remove());
+        childNode.querySelectorAll('div:empty, span:empty').forEach(el => el.remove());
+        childNode.querySelectorAll('div:empty, span:empty').forEach(el => el.remove());
+        childNode.querySelectorAll('div:empty, span:empty').forEach(el => el.remove());
+
         let text = childNode?.innerText?.trim()
         return {text, childNode, key};
     }
@@ -91,7 +110,7 @@
             return;
         }
         ta.focus();
-
+        let value = ta.value;
         let success = false;
         if (document.execCommand) {
             try {
@@ -106,7 +125,10 @@
             ta.dispatchEvent(new Event('change', {bubbles: true}));
             ta.dispatchEvent(new Event('compositionend', {bubbles: true}));
         }
-
+        if (value) {
+            toast({type: 'warning', ms: 10000}, '需手动发送');
+            return;
+        }
         let sendBtn = document.querySelector('div[role="button"].ds-button--primary.ds-button--circle:not(.ds-button--disabled)');
         if (!sendBtn) {
             const svg = document.querySelector('svg path[d*="M8.3125 0.981587"]');
@@ -329,7 +351,7 @@
             lastOver = true;
             processing = true;
 
-            let closeDiv = toast({ms: 500000}, lastAIMessageKey + '🤖回复预览:', `len: ${finalText.length}`, `${lastProcessedText.slice(0, 10)}...${lastProcessedText.slice(-10)}`);
+            let closeDiv = toast({ms: 500000}, lastAIMessageKey + '🦊' + `len: ${finalText.length}`, `${lastProcessedText.slice(0, 10)}...${lastProcessedText.slice(-10)}`);
 
             if (!wsConnected) connectWebSocket();
             clearTimeout(lastTimeout);
@@ -385,7 +407,6 @@
 
     function sendPromptOnce(prompt) {
         let pathname = location.pathname;
-        let key = 'agent_prompt_sent' + pathname;
         if (pathname.length < 10) {
             sendMessageToWeb(prompt);
             toast({}, '系统提示词已发送');
@@ -406,14 +427,14 @@
                 .then(prompt => {
                     toast({}, '获取到服务端提示词');
                     sendPromptOnce(prompt);
+                    setupDOMObserver();
+                    setInterval(() => document.querySelectorAll('.ds-button--warning')[0]?.click(), 1000 * 60)
                 })
                 .catch(err => {
                     toast({type: "error"}, '获取提示词失败:' + err);
                     stopAgent();
                 });
         }
-        setupDOMObserver();
-        setInterval(() => document.querySelectorAll('.ds-button--warning')[0]?.click(), 1000 * 60)
     }
 
     function stopAgent() {

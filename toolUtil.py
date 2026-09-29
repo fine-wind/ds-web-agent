@@ -202,6 +202,12 @@ def write_file(path: str, content: str, encoding: str = "utf-8", append: bool = 
         raise SandboxError(f"写入内容过大 ({len(data)} bytes)")
 
     p.parent.mkdir(parents=True, exist_ok=True)
+    if append and p.exists():
+        prev = p.read_text(encoding=encoding)
+        if content.strip() and prev.rstrip().endswith(content.strip()):
+            return {"path": _rel(p), "bytes": 0, "append": True, "dup": True}
+        if prev and not prev.endswith(chr(10)):
+            content = chr(10) + content
     mode = "a" if append else "w"
     with p.open(mode, encoding=encoding, newline="\n") as f:
         f.write(content)
