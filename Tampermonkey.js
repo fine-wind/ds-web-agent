@@ -29,7 +29,7 @@
     // DOM 观察器
     let observerTimer = null;
     const box = document.createElement('div');// log box
-    box.style.cssText = `position: fixed;right: 20px;bottom: 20px;display: flex;flex-direction: column;gap: 10px;z-index: 9999;`;
+    box.style.cssText = `position: fixed;right: 20px;bottom: 20px;display: flex;flex-direction: column;gap: 10px;z-index: 9999;width: 23%;`;
     document.body.appendChild(box);
 
     function toast({type = 'info', ms = 3000} = {}, ...msg) {
@@ -94,12 +94,12 @@
         childNode.querySelectorAll('div:empty, span:empty').forEach(el => el.remove());
         childNode.querySelectorAll('div:empty, span:empty').forEach(el => el.remove());
 
-        let text = childNode?.innerText?.trim()
+        let text = childNode?.innerHTML?.trim()
         return {text, childNode, key};
     }
 
 
-    function sendMessageToWeb(text) {
+    function sendMessageToWeb(text, send = true) {
         if ((text || '').length < 1) {
             return;
         }
@@ -129,27 +129,29 @@
             toast({type: 'warning', ms: 10000}, '需手动发送');
             return;
         }
-        let sendBtn = document.querySelector('div[role="button"].ds-button--primary.ds-button--circle:not(.ds-button--disabled)');
-        if (!sendBtn) {
-            const svg = document.querySelector('svg path[d*="M8.3125 0.981587"]');
-            if (svg) {
-                const parent = svg.closest('div[role="button"]');
-                if (parent && !parent.classList.contains('ds-button--disabled')) sendBtn = parent;
-            }
-        }
-        if (sendBtn) {
-            sendBtn.click();
-            toast({}, '✅ 点击发送按钮');
-            setTimeout(() => {
-                if (ta.value !== '') {
-                    ta.value = '';
-                    ta.dispatchEvent(new Event('input', {bubbles: true}));
+        if (send) {
+            let sendBtn = document.querySelector('div[role="button"].ds-button--primary.ds-button--circle:not(.ds-button--disabled)');
+            if (!sendBtn) {
+                const svg = document.querySelector('svg path[d*="M8.3125 0.981587"]');
+                if (svg) {
+                    const parent = svg.closest('div[role="button"]');
+                    if (parent && !parent.classList.contains('ds-button--disabled')) sendBtn = parent;
                 }
-            }, 100);
-        } else {
-            ta.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true}));
-            ta.dispatchEvent(new KeyboardEvent('keyup', {key: 'Enter', bubbles: true}));
-            toast({}, '⚠️ 未找到发送按钮，模拟 Enter 键');
+            }
+            if (sendBtn) {
+                sendBtn.click();
+                toast({}, '✅ 点击发送按钮');
+                setTimeout(() => {
+                    if (ta.value !== '') {
+                        ta.value = '';
+                        ta.dispatchEvent(new Event('input', {bubbles: true}));
+                    }
+                }, 100);
+            } else {
+                ta.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true}));
+                ta.dispatchEvent(new KeyboardEvent('keyup', {key: 'Enter', bubbles: true}));
+                toast({}, '⚠️ 未找到发送按钮，模拟 Enter 键');
+            }
         }
     }
 
@@ -308,7 +310,6 @@
         let textRound = 1;  // 上一次文本
         let lastOver = false;        // 该条消息是否已处理完
         let lastTime = new Date().getTime();        // 该条消息是否已处理完
-        let lastTimeout = -1;        // 该条消息是否已处理完
 
         observerTimer = setInterval(() => {
             const latest = getLatestAIMessage();
@@ -344,17 +345,16 @@
             }
 
             if (!isRunning || processing) {
-                toast({ms: 5000}, lastAIMessageKey + `运行状态：${isRunning}`, `任务状态：${isRunning}`)
+                // toast({ms: 5000}, lastAIMessageKey + `运行状态：${isRunning}`, `任务状态：${isRunning}`)
                 return;
             }
 
             lastOver = true;
             processing = true;
 
-            let closeDiv = toast({ms: 500000}, lastAIMessageKey + '🦊' + `len: ${finalText.length}`, `${lastProcessedText.slice(0, 10)}...${lastProcessedText.slice(-10)}`);
+            let closeDiv = toast({ms: 500000}, lastAIMessageKey + '🐋' + `len: ${finalText.length}`, `${lastProcessedText.slice(0, 10)}...${lastProcessedText.slice(-10)}`);
 
             if (!wsConnected) connectWebSocket();
-            clearTimeout(lastTimeout);
             sendWebSocketRequest({content: finalText})
                 .then(result => {
                     toast({}, lastAIMessageKey, '后端处理结果:', result);
@@ -380,13 +380,8 @@
                             dataStr = String(data);
                         }
                         msg = dataStr;
-                        const needMs = (finalText.length / READ_CHAT_BY_S) * 1000;
-                        const remaining = Math.max(needMs - (Date.now() - lastTime), 0);
-                        toast({ms: remaining}, `🐂：${msg.slice(0, 10)}...${msg.slice(-10)}`)
-
-                        lastTimeout = setTimeout(() => {
-                            sendMessageToWeb(msg);
-                        }, remaining);
+                        toast({ms: 1000 * 60}, `🐂：${msg.slice(0, 10)}...${msg.slice(-10)}`)
+                        sendMessageToWeb(msg, false); // 这里把小牛的消息发送出来
                     } else {
                         // 出错时允许重新处理同一 AI 消息
                         toast({type: 'error', ms: 10000}, `执行结果：操作失败，${result.message || '未知错误'}`)
@@ -408,7 +403,7 @@
     function sendPromptOnce(prompt) {
         let pathname = location.pathname;
         if (pathname.length < 10) {
-            sendMessageToWeb(prompt);
+            sendMessageToWeb(prompt || '你好');
             toast({}, '系统提示词已发送');
             setTimeout(() => {
                 localStorage.setItem('agent_prompt_sent' + location.pathname, 'true');

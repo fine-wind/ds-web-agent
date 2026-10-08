@@ -34,13 +34,9 @@ WORK_DIR = Path(WORK_DIR_ENV).resolve()
 WORK_DIR.mkdir(exist_ok=True, parents=True)
 
 # ---------- 日志配置（轮转） ----------
-LOG_FILE = AGENT_DIR / "execution.log"
 logger = logging.getLogger('AgentExecutor')
 logger.setLevel(logging.INFO)
 if not logger.handlers:
-    handler = RotatingFileHandler(LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5, encoding='utf-8')
-    handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-    logger.addHandler(handler)
     console = logging.StreamHandler()
     console.setLevel(logging.INFO)
     logger.addHandler(console)
@@ -243,7 +239,7 @@ async def handle_client_message(data, request_id):
     if not content.strip():
         return make_response("skipped", message="content 为空，已跳过")
 
-    logger.info(f"消息 {content}")
+    # logger.info(f"消息 {content}")
 
     if "@小牛" not in content:
         return make_response("skipped", message="非小牛的消息")
@@ -344,7 +340,6 @@ if __name__ == '__main__':
     print(f"📁 工作目录 (默认相对根): {WORK_DIR}")
     print(f"🔌 WebSocket 监听地址: {WS_HOST}:{WS_PORT}")
     print(f"🧠 模型接口: {LLAMA_HOST}  model={LLAMA_MODEL}")
-    print(f"📋 日志文件: {LOG_FILE} (轮转: 10MB/5备份)")
     web_prompt_file = AGENT_DIR / "prompt.md"
     local_prompt_file = AGENT_DIR / "prompt_local_llm.md"
     print(f"📝 网页 AI 提示词: {web_prompt_file if web_prompt_file.exists() else '内置默认'}")
